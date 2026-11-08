@@ -65,8 +65,18 @@ const srcGate = (u, s) => orderGate(u)({ organization: s.name, company: s.name }
 // ---------- live events (SSE) ----------
 const clients = new Set();
 // chats with retail shops are private to their region: administrator, the person handling the chat, and people given that region
-const canSeeConv = (u, c) => !c || !c.retailId || !u || u.role === 'admin' || c.agentId === u.id || retail.canSeeRegion(u, c.retailRegion);
-bot.bus.on('event', e => { const data = `data: ${JSON.stringify(e)}\n\n`; for (const c of clients) { if (e.type === 'mail' && !(c.me && (c.me.role === 'admin' || c.me.id === e.thread.agentId))) continue; if (e.type === 'webcall' && e.call.agentId && !(c.me && (c.me.role === 'admin' || c.me.id === e.call.agentId))) continue; const cv = e.type === 'conversation' ? e.conversation : e.type === 'message' && e.message ? db.conversations[e.message.phone] : e.type === 'messages-deleted' ? db.conversations[e.phone] : e.type === 'call' || e.type === 'webcall' ? db.conversations[e.call.phone] : null; if (cv && !canSeeConv(c.me, cv)) continue; c.write(data); } });
+// Without the API (linked phone) each team member sees ONLY the chats assigned to them; the administrator sees everything.
+// (With the official API the old rule stays: everyone sees the shared inbox, retail chats only for the people given access.)
+const ownOnly = () => wa.mode() !== 'cloud' && link.settings().ownOnly !== false;
+const canSeeConv = (u, c) => {
+  if (!c || !u || u.role === 'admin') return true;
+  if (c.isGroup) return c.agentId === u.id;                        // a WhatsApp group: only the team member the administrator assigned it to
+  if (!c.createdAt) return true;                                   // not a real chat yet (e.g. starting a new one)
+  if (c.agentId === u.id) return true;
+  if (c.retailId && retail.canSeeRegion(u, c.retailRegion)) return true;
+  return ownOnly() ? false : !c.retailId;
+};
+bot.bus.on('event', e => { const data = `data: ${JSON.stringify(e)}\n\n`; for (const c of clients) { if (e.type === 'mail' && !(c.me && (c.me.role === 'admin' || c.me.id === e.thread.agentId))) continue; if (e.type === 'webcall' && e.call.agentId && !(c.me && (c.me.role === 'admin' || c.me.id === e.call.agentId))) continue; const cv = e.type === 'conversation' ? e.conversation : e.type === 'message' && e.message ? db.conversations[e.message.phone] : e.type === 'messages-deleted' ? db.conversations[e.phone] : e.type === 'call' || e.type === 'webcall' ? db.conversations[e.call.phone] : null; if (cv && !canSeeConv(c.me, cv)) { if (e.type === 'conversation') c.write(`data: ${JSON.stringify({ type: 'conversation-removed', phone: cv.phone })}\n\n`); continue; } c.write(data); } });
 // everything the Settings → WhatsApp card needs: which connection is in use, whether Cloud API keys exist, linked-phone state
 const waStatus = () => ({ ...link.status(), mode: wa.mode(), cloud: wa.mode() === 'cloud', live: wa.connected(), apiKeys: wa.hasApiKeys(), apiOn: wa.apiOn(), callsApi: wa.callsOn() });
 link.bus.on('status', () => {
@@ -97,7 +107,7 @@ async function api(req, res, url) {
   }
   if (p === '/api/bootstrap' && m === 'GET') {
     return json(res, 200, {
-      me: { ...pub(me), username: me.username }, live: wa.connected(), mode: wa.mode(), callsApi: wa.callsOn(), webhookPath: '/webhook', verifyToken: admin ? cfg.verifyToken : undefined,
+      me: { ...pub(me), username: me.username }, ownOnly: !admin && ownOnly(), live: wa.connected(), mode: wa.mode(), callsApi: wa.callsOn(), webhookPath: '/webhook', verifyToken: admin ? cfg.verifyToken : undefined,
       agents: db.agents.map(a => ({ ...pub(a), ...(admin ? { username: a.username } : {}), load: Object.values(db.conversations).filter(c => c.agentId === a.id && c.status === 'assigned').length })),
       organizations: db.organizations, settings: publicSettings(),
       conversations: Object.values(db.conversations).filter(c => canSeeConv(me, c)).sort((a, b) => b.updatedAt - a.updatedAt),
@@ -110,6 +120,11 @@ async function api(req, res, url) {
   if ((mt = p.match(/^\/api\/conversations\/(\d+)\/(messages|send|send-media|delete-messages|forward|assign|resolve|read|reopen|suggest|ai-draft|ai-ask)$/))) {
     const phone = mt[1], act = mt[2], conv = db.conversations[phone];
     if (!conv || !canSeeConv(me, conv)) return json(res, 404, { error: 'Conversation not found' });
+    // WhatsApp groups: the assigned team member may only read, send messages / files / voice notes and start the voice call.
+    // Assigning, resolving, deleting, forwarding and the AI helper are for the administrator.
+    if (conv.isGroup && !admin && !['messages', 'send', 'send-media', 'read'].includes(act)) return json(res, 403, { error: 'Only an administrator can do this in a WhatsApp group. You can chat and call in it.' });
+    if (conv.isGroup && act === 'messages') return json(res, 200, { messages: db.messages.filter(x => x.phone === phone).slice(-300), orders: [], suggestion: null, handler: null });
+    if (conv.isGroup && act === 'suggest') return json(res, 200, { suggestion: null });
     if (act === 'messages') return json(res, 200, { messages: db.messages.filter(x => x.phone === phone).slice(-300), orders: orders.findByPhone(phone), suggestion: track.suggestion(conv), handler: conv.orgName ? track.handlerOf(conv.orgName) : null });
     if (act === 'suggest') return json(res, 200, { suggestion: track.suggestion(conv) });
     if (act === 'ai-draft') { try { return json(res, 200, await ai.draftReply(conv)); } catch (e) { return json(res, 502, { error: e.message }); } }
@@ -139,9 +154,10 @@ async function api(req, res, url) {
       if (!to.length || !Array.isArray(b.ids) || !b.ids.length) return json(res, 400, { error: 'Choose the messages and at least one chat' });
       return json(res, 200, await bot.forward(phone, b.ids.map(String), to, me));
     }
-    if (act === 'assign') { const b = await readJson(req); try { bot.transfer(phone, b.agentId, me.name); return json(res, 200, { ok: true }); } catch (e) { return json(res, 400, { error: e.message }); } }
+    if (act === 'assign') { const b = await readJson(req); if (conv.isGroup && b.agentId && !db.agents.some(a => a.id === b.agentId && a.active)) return json(res, 400, { error: 'Choose an active team member' }); try { bot.transfer(phone, b.agentId, me.name); return json(res, 200, { ok: true }); } catch (e) { return json(res, 400, { error: e.message }); } }
     if (act === 'resolve') { await bot.resolve(phone, me.name); return json(res, 200, { ok: true }); }
-    if (act === 'reopen') { conv.status = 'assigned'; conv.agentId = conv.agentId || me.id; conv.stage = 'human'; store.save(); bot.emitConv(conv); return json(res, 200, { ok: true }); }
+    if (act === 'reopen' && conv.isGroup) { conv.status = conv.agentId ? 'assigned' : 'waiting'; store.save(); bot.emitConv(conv); return json(res, 200, { ok: true }); }
+    if (act === 'reopen') { conv.status = 'assigned'; conv.agentId = conv.agentId || me.id; conv.stage = 'human'; conv.botOpen = false; store.save(); bot.emitConv(conv); return json(res, 200, { ok: true }); }
   }
 
   // files in chats (voice notes, pictures ...): served only to people who may see that chat; supports Range so audio can be scrubbed
@@ -178,6 +194,19 @@ async function api(req, res, url) {
   if ((mt = p.match(/^\/api\/webcall\/([a-f0-9]+)\/(answer|end)$/)) && m === 'POST') {
     const r = webcall.roomOf(mt[1]), cv = r && db.conversations[r.phone]; if (!r || !canSeeConv(me, cv)) return json(res, 404, { error: 'This call has already ended.' });
     try { return json(res, 200, mt[2] === 'answer' ? webcall.answer(mt[1], String((await readJson(req)).sdp || ''), me) : webcall.end(mt[1], 'agent')); } catch (e) { return json(res, 400, { error: e.message }); }
+  }
+
+  // WhatsApp groups (administrator): every group the linked number is in, and which team member looks after each
+  if (p === '/api/groups' && m === 'GET') {
+    if (!need()) return;
+    let phoneGroups = []; try { phoneGroups = await link.listGroups(); } catch { /* not connected: show the groups we already know */ }
+    return json(res, 200, { connected: link.connected(), linkMode: wa.mode() === 'link', enabled: link.settings().groups !== false, groups: bot.groupList(phoneGroups) });
+  }
+  if ((mt = p.match(/^\/api\/groups\/(\d+)\/assign$/)) && m === 'POST') {
+    if (!need()) return;
+    const b = await readJson(req), jid = String(b.jid || '');
+    if (b.agentId && !db.agents.some(a => a.id === b.agentId && a.active)) return json(res, 400, { error: 'Choose an active team member' });
+    try { bot.ensureGroup(mt[1], jid, String(b.name || '')); bot.transfer(mt[1], b.agentId || '', me.name); return json(res, 200, { ok: true }); } catch (e) { return json(res, 400, { error: e.message }); }
   }
 
   // WhatsApp links (admin): public forms that send customers to WhatsApp and route them to the right person
@@ -225,7 +254,8 @@ async function api(req, res, url) {
   if (p === '/api/simulate' && m === 'POST') {
     const b = await readJson(req); const phone = cleanPhone(b.phone);
     if (phone.length < 7) return json(res, 400, { error: 'Enter a phone number' });
-    await bot.onIncoming({ phone, name: b.name || '', text: b.text || '', replyId: b.replyId });
+    const L = link.settings(), lm = wa.mode() !== 'cloud'; // the Test Phone behaves like the real linked number
+    await bot.onIncoming({ phone, name: b.name || '', text: b.text || '', replyId: b.replyId, ...(lm ? { noBot: !L.autoBot, autoAssign: L.assignNew !== false } : {}) });
     return json(res, 200, { ok: true });
   }
 
@@ -592,7 +622,7 @@ http.createServer(async (req, res) => {
   } catch (e) { console.error(e); if (!res.headersSent) json(res, 500, { error: e.message }); else res.end(); }
 }).listen(cfg.port, () => {
   link.setHandlers({
-    onMessage: async x => { try { if (wa.mode() !== 'link') return; /* API switch is on: the linked phone is paused */ if (x.fromMe) await bot.onPhoneSent(x); else await bot.onIncoming({ ...x, noBot: !link.settings().autoBot }); } catch (e) { console.error('linked phone message failed:', e); } },
+    onMessage: async x => { try { if (wa.mode() !== 'link') return; /* API switch is on: the linked phone is paused */ if (x.isGroup) bot.onGroupMessage(x); else if (x.fromMe) await bot.onPhoneSent(x); else { const L = link.settings(); await bot.onIncoming({ ...x, noBot: !L.autoBot, autoAssign: L.assignNew !== false }); } } catch (e) { console.error('linked phone message failed:', e); } },
     onCall: x => wa.mode() === 'link' ? bot.onCall(x).catch(() => ({})) : ({}),
   });
   link.start();

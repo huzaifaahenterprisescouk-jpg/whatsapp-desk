@@ -47,6 +47,37 @@ Good to know:
 * Needs https (or localhost) so browsers allow the microphone. On some mobile networks add a TURN server in `.env`: `TURN_URL`, `TURN_USER`, `TURN_PASS`.
 * Voice only (no video). With the API box ticked, the existing **Call** button rings on the customer's own WhatsApp instead.
 
+## With API or without API, and who gets new messages (new)
+
+**Settings → WhatsApp connection** (administrator) now starts with a clear choice:
+
+- **Without API** (your own number, linked like WhatsApp Web): free, no message limits, no templates, no 24-hour rule. Customers still get the same welcome message and menu (as a numbered list: they reply 1, 2 …).
+- **With API** (official Meta Cloud API): tappable buttons and calling from the desk, but Meta's limits and fees apply. This option is greyed out until `WHATSAPP_TOKEN` and `WHATSAPP_PHONE_NUMBER_ID` are in `.env`.
+
+Only one is active at a time. Switching is instant and keeps all chats.
+
+**Without API, every new chat goes straight to the person who handles that customer's organization.** Under *Who gets new chats (without API)*:
+
+- **Assign every new chat automatically** (on by default). The desk finds the customer's organization from their phone number in your order sheets (or from what they type, e.g. "I'm from Hilton"), and gives the chat to that organization's contact (or the backup when they are off duty). The chat appears in that person's **Mine** list from the first message. The customer still gets the welcome menu, and the bot can still answer order tracking; it steps aside as soon as a team member replies, from the desk or from the phone itself.
+- **If the organization is not known** (the number is not in your order sheets), the customer gets your normal welcome menu and nobody is assigned yet. When they tap **Track my order**, **Talk to our team**, or type **call**, the bot first sends your prebuilt "tell us the name of your organization" message. Once they answer, the chat goes straight to that organization's person (main, then backup when off duty): *Talk to our team* connects them, *call* sends that person's number, *Track my order* assigns the person and keeps the order lookup working. If you prefer, choose a fixed person in Settings to receive unknown customers right away (they are still asked for their organization). An organization the desk does not know gets your "not found" message and the chat goes to the least busy person, so nothing is lost. A voice note or photo goes straight to the chat's owner.
+- **Returning customers stay with their usual person** (on by default). Untick to decide again every time from the customer's organization.
+- **Team members see only their own chats** (on by default). Each person sees just the chats assigned to them (no *Unassigned* / *All* tabs); the administrator sees everything and can move a chat to someone else, after which it disappears from the previous person's screen at once.
+- **Send the welcome menu automatically**: untick for a plain shared inbox (chats are still assigned, nobody gets an automatic answer).
+
+The assigned person does everything from the desk: text, voice notes, photos and files, links, the in-desk **Voice call** button, PO / P.R / CN lookups. (WhatsApp does not allow a linked number to ring or answer WhatsApp calls itself, so calls use the desk's browser voice call or the phone **Call** button.) Nothing changes when *With API* is selected: the shared inbox works as before.
+
+## WhatsApp groups: the administrator assigns, the team member chats and calls (new)
+
+Works **without the API** (your own linked number). Every group the number is in can be handled in the desk.
+
+* **Admin → Groups** (left menu) lists every group your number is in. Next to each group, **Handled by** picks the team member who looks after it (or *Nobody* = only the administrator). *Refresh groups* reloads the list from the phone. A group also appears the moment someone writes in it. Messages show the sender's name and number.
+* **The team member** sees only the groups assigned to them (in **Mine** and the **Groups** tab). In their groups they can **send messages, photos, files and voice notes** and press **Voice call**. Nothing else: no assigning, resolving, deleting, forwarding or AI helper (the server refuses these, not just the screen). A group that is not theirs is invisible to them. When the administrator moves a group to someone else, it disappears from the previous person's screen at once.
+* **The administrator** can do everything in every group: read, chat, voice-call, assign / un-assign (also from the box at the top of a group chat), resolve / reopen and delete messages.
+* The welcome bot **never** answers in a group, and *Resolve* does not post anything into the group. A new message reopens a resolved group.
+* **Voice call in a group:** WhatsApp does not let a linked number start its own group call, so the desk posts its browser voice-call link in the group. The first member who opens it talks with the team member in the desk (one person at a time, voice only, same as the customer call described above).
+* Messages you type on the phone itself in a group also show in the desk. Groups are never marked as read automatically (that would show blue ticks to everyone in the group).
+* **Settings → WhatsApp connection → Bring WhatsApp groups into the desk** switches all of this on or off (on by default). With the official API selected, groups are paused (the API has no group chats).
+
 ## 1. Try it in 1 minute (no WhatsApp needed)
 
 ```
