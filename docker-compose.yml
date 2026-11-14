@@ -1,0 +1,20 @@
+services:
+  whatsapp-desk:
+    build: .
+    container_name: whatsapp-desk
+    restart: always
+    ports:
+      - "3000:3000"
+    env_file: .env
+    environment:
+      - TZ=Asia/Karachi
+      - MAIL_ARCHIVE_DIR=/archive
+      - MAIL_KEEP_DAYS=365
+    volumes:
+      - ./data:/app/data
+      # Optional: a folder on your NAS holding the Excel file (e.g. kept in sync with OneDrive by Synology Cloud Sync).
+      # Then paste /sheets/yourfile.xlsx in a company sheet's link box instead of a link.
+      - ./sheets:/sheets:ro
+      # Mail older than one year is moved here (searchable and openable in Email > More > Older mail).
+      # On a Synology, point the left side at a shared folder, e.g. /volume1/docker/whatsapp-desk/mail-archive
+      - ./mail-archive:/archive
