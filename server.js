@@ -1,0 +1,1267 @@
+const http = require('http'), fs = require('fs'), path = require('path'), crypto = require('crypto'), zlib = require('zlib');
+const cfg = require('./lib/config');
+const store = require('./lib/store');
+store.load();
+const auth0 = require('./lib/auth'); auth0.migrate(); // usernames + hashed passwords (old PINs become the password)
+const bot = require('./lib/bot');
+const loginpage = require('./lib/loginpage');
+const orders = require('./lib/orders');
+const sync = require('./lib/sync');
+const writeback = require('./lib/writeback');
+const ms = require('./lib/msgraph');
+const retail = require('./lib/retail');
+const qbo = require('./lib/qbo');
+const woo = require('./lib/woo');
+const erp = require('./lib/erp');
+const reports = require('./lib/reports');
+const daily = require('./lib/daily');
+const social = require('./lib/social');
+const pofollow = require('./lib/pofollow');
+const dcalerts = require('./lib/dcalerts');
+dcalerts.bind({ orders, get groupOf() { return groupOf; } });
+const dcdocs = require('./lib/dcdocs');
+const dcitems = require('./lib/dcitems');
+const dcfiles = require('./lib/dcfiles');
+const itemidx = require('./lib/itemidx');
+const letterhead = require('./lib/letterhead');
+const dccols = require('./lib/dccols');
+const dcexport = require('./lib/dcexport');
+const inbox = require('./lib/inbox');
+const track = require('./lib/track');
+const receipt = require('./lib/receipt');
+const quotes = require('./lib/quotes');
+const livetrack = require('./lib/livetrack');
+const ai = require('./lib/ai');
+const signature = require('./lib/signature');
+const wa = require('./lib/whatsapp');
+const link = require('./lib/wa-link'), wapost = require('./lib/wa-post');
+const media = require('./lib/media');
+const calls = require('./lib/calls');
+const links = require('./lib/links');
+const shortlinksBase = o => require('./lib/shortlinks').base(o) || o;   // the address customers will really see
+const webcall = require('./lib/webcall');
+const { writeRows } = require('./lib/xlsx');
+const { pdfTable } = require('./lib/pdf');
+
+const db = store.db;
+if (!db.secret) { db.secret = crypto.randomBytes(24).toString('hex'); store.save(true); }
+
+const PUBLIC = path.join(__dirname, 'public');
+// ---------- tiny helpers ----------
+const gzCache = new Map();
+const MIME = { '.html': 'text/html; charset=utf-8', '.css': 'text/css', '.js': 'text/javascript', '.svg': 'image/svg+xml', '.png': 'image/png', '.ico': 'image/x-icon', '.json': 'application/json' };
+const json = (res, code, obj) => { // gzip big answers (the mailbox list is hundreds of KB) so they load several times faster
+  const body = Buffer.from(JSON.stringify(obj)), gz = body.length > 1024 && /\bgzip\b/.test(String((res.req && res.req.headers['accept-encoding']) || ''));
+  if (!gz) { res.writeHead(code, { 'Content-Type': 'application/json' }); return res.end(body); }
+  zlib.gzip(body, { level: 4 }, (err, z) => { if (err) { res.writeHead(code, { 'Content-Type': 'application/json' }); return res.end(body); } res.writeHead(code, { 'Content-Type': 'application/json', 'Content-Encoding': 'gzip', Vary: 'Accept-Encoding' }); res.end(z); });
+};
+const readBody = (req, limit = 12e6) => new Promise((ok, fail) => {
+  const chunks = []; let n = 0;
+  req.on('data', c => { n += c.length; if (n > limit) { fail(new Error('Upload too large')); req.destroy(); } else chunks.push(c); });
+  req.on('end', () => ok(Buffer.concat(chunks)));
+  req.on('error', fail);
+});
+const readJson = async (req, limit) => { const b = await readBody(req, limit); try { return b.length ? JSON.parse(b) : {}; } catch { throw new Error('Invalid JSON'); } };
+const cleanPhone = p => String(p || '').replace(/\D/g, '');
+
+const sign = s => crypto.createHmac('sha256', db.secret).update(s).digest('hex').slice(0, 32);
+const makeToken = a => { const body = `${a.id}.${Date.now() + 14 * 86400000}.${auth0.pwTag(a)}`; return `${body}.${sign(body)}`; }; // the tag changes with the password, so a password change ends old sessions
+function auth(req, url) {
+  const h = req.headers.authorization || ''; const t = h.startsWith('Bearer ') ? h.slice(7) : url.searchParams.get('token');
+  if (!t) return null; const p = t.split('.'); if (p.length !== 4) return null;
+  const body = `${p[0]}.${p[1]}.${p[2]}`;
+  if (sign(body) !== p[3] || +p[1] < Date.now()) return null;
+  const a = bot.agentById(p[0]); return a && a.pwd && auth0.pwTag(a) === p[2] ? a : null;
+}
+const pub = a => ({ id: a.id, name: a.name, role: a.role, color: a.color, active: a.active, phone: a.phone || '', email: a.email || '', title: a.title || '', retailAccess: !retail.scopeOf(a) || retail.scopeOf(a).length > 0, retailRegions: retail.scopeOf(a) || [] });
+const publicSettings = () => db.settings;
+// Order sheets are private to the team member who looks after that company (Organizations -> main person or backup). Admin sees everything.
+function orderGate(u) {
+  if (u && u.role === 'admin') return () => true;
+  const memo = new Map(), al = u ? dcalerts.orgSet(u.id) : new Set(), gm = new Map(); // al: companies given to this person by the DC alerts (Settings), so the alert can open them
+  return o => {
+    const k = (o.organization || '') + '|' + (o.company || '');
+    if (!memo.has(k)) { const g = track.orgFor(o.organization) || track.orgFor(o.company); memo.set(k, !!(g && u && (g.agentId === u.id || g.backupAgentId === u.id)) || (al.size > 0 && (al.has('*') || al.has(groupOf(o, gm).key)))); }
+    return memo.get(k);
+  };
+}
+// which company (organization) an order belongs to, and who handles it. memo = a Map reused for one request.
+function groupOf(o, memo) {
+  const raw = o.organization || o.company || '', k = (o.organization || '') + '|' + (o.company || '');
+  if (!memo.has(k)) { const org = track.orgFor(o.organization) || track.orgFor(o.company) || null; memo.set(k, { key: org ? org.id : 'x:' + raw.toLowerCase(), name: org ? org.name : raw || 'No company', agentId: org ? org.agentId || '' : '', backupAgentId: org ? org.backupAgentId || '' : '' }); }
+  return memo.get(k);
+}
+// ?org= ?agent= ?backup=1 ?cls=dispatched|self|pending|other ?from= ?to= (days in the DC date / order date column) ?dfrom= ?dto= (days in the Dispatch date column) -> a test for one order, or null when nothing is filtered
+function orderFilter(qs) {
+  const day = v => /^\d{4}-\d{2}-\d{2}$/.test(v || '') ? v : '', from = day(qs.get('from')), to = day(qs.get('to')), dfrom = day(qs.get('dfrom')), dto = day(qs.get('dto')), cls = qs.get('cls') || '', org = qs.get('org') || '', agent = qs.get('agent') || '', backup = qs.get('backup') === '1', bill = ['billed', 'remaining'].includes(qs.get('bill')) ? qs.get('bill') : '';
+  const itemQ = String(qs.get('item') || '').trim(), itemS = itemQ.length >= 2 ? dcfiles.itemSearch(itemQ) : null;   // ?item= words that must all be found in an item of the DC
+  if (!from && !to && !dfrom && !dto && !cls && !org && !agent && !bill && !itemS) return null;
+  const memo = new Map(), orgList = org.split('\u001f');   // ?org= one company key, or several separated by the unit-separator character (the DC alert opens all of a person's companies)
+  const f = o => {
+    if (from || to) { const d = o.orderDay || ''; if (!d || (from && d < from) || (to && d > to)) return false; }
+    if (dfrom || dto) { const ds = orders.dispatchDaysOf(o); if (!ds.some(d => (!dfrom || d >= dfrom) && (!dto || d <= dto))) return false; }   // Dispatch date column (a DC with two parcels matches either date)
+    if (cls && orders.classOf(o) !== cls) return false;
+    if (bill) { const b = orders.billedOf(o); if ((bill === 'billed') !== b) return false; }
+    if (org || agent) { const g = groupOf(o, memo); if (org && !orgList.includes(g.key)) return false; if (agent && g.agentId !== agent && !(backup && g.backupAgentId === agent)) return false; }
+    if (itemS && !itemS.test(o)) return false;   // last: the slowest test only runs for the DCs that passed every other filter
+    return true;
+  };
+  return f;
+}
+const srcGate = (u, s) => orderGate(u)({ organization: s.name, company: s.name });
+
+// ---------- live events (SSE) ----------
+const clients = new Set();
+// chats with retail shops are private to their region: administrator, the person handling the chat, and people given that region
+// Without the API (linked phone) each team member sees ONLY the chats assigned to them; the administrator sees everything.
+// (With the official API the old rule stays: everyone sees the shared inbox, retail chats only for the people given access.)
+const ownOnly = () => wa.mode() !== 'cloud' && link.settings().ownOnly !== false;
+const canSeeConv = (u, c) => {
+  if (!c || !u || u.role === 'admin') return true;
+  if (c.isGroup) return c.agentId === u.id;                        // a WhatsApp group: only the team member the administrator assigned it to
+  if (!c.createdAt) return true;                                   // not a real chat yet (e.g. starting a new one)
+  if (c.agentId === u.id) return true;
+  if (c.retailId && retail.canSeeRegion(u, c.retailRegion)) return true;
+  return ownOnly() ? false : !c.retailId;
+};
+wapost.bus.on('status', () => { const d = `data: ${JSON.stringify({ type: 'wapost', status: wapost.status() })}\n\n`; for (const c of clients) if (c.me && c.me.role === 'admin') c.write(d); });
+bot.bus.on('event', e => { const data = `data: ${JSON.stringify(e)}\n\n`; for (const c of clients) { if (e.type === 'mailfail' && !(c.me && c.me.id === e.agentId)) continue; if (e.type === 'mail' && !(c.me && (c.me.role === 'admin' || c.me.id === e.thread.agentId || inbox.fullAccess(e.thread.accountId, c.me.id)))) continue; if (e.type === 'mail') { c.write(`data: ${JSON.stringify({ ...e, thread: inbox.forViewer(e.thread, c.me) })}\n\n`); continue; } if (e.type === 'webcall' && e.call.agentId && !(c.me && (c.me.role === 'admin' || c.me.id === e.call.agentId))) continue; const cv = e.type === 'conversation' ? e.conversation : e.type === 'message' && e.message ? db.conversations[e.message.phone] : e.type === 'messages-deleted' ? db.conversations[e.phone] : e.type === 'call' || e.type === 'webcall' ? db.conversations[e.call.phone] : null; if (cv && !canSeeConv(c.me, cv)) { if (e.type === 'conversation') c.write(`data: ${JSON.stringify({ type: 'conversation-removed', phone: cv.phone })}\n\n`); continue; } c.write(data); } });
+// everything the Settings → WhatsApp card needs: which connection is in use, whether Cloud API keys exist, linked-phone state
+const waStatus = () => ({ ...link.status(), mode: wa.mode(), cloud: wa.mode() === 'cloud', live: wa.connected(), apiKeys: wa.hasApiKeys(), apiOn: wa.apiOn(), callsApi: wa.callsOn() });
+link.bus.on('status', () => {
+  const adm = `data: ${JSON.stringify({ type: 'wa', status: waStatus() })}\n\n`, all = `data: ${JSON.stringify({ type: 'wamode', mode: wa.mode(), live: wa.connected(), callsApi: wa.callsOn() })}\n\n`;
+  for (const c of clients) { if (c.me && c.me.role === 'admin') c.write(adm); c.write(all); } // everyone learns which connection is active (Call button changes)
+});
+setInterval(() => { for (const c of clients) c.write(': ping\n\n'); }, 25000);
+
+// ---------- API ----------
+async function api(req, res, url) {
+  const p = url.pathname, m = req.method;
+  // the ERP calls these with its API key (Integrations page), not with a person's sign-in
+  if (p === '/api/erp/push' && m === 'POST') {
+    if (!erp.keyOk(req)) return json(res, 401, { error: 'Missing or wrong API key. Send it as "Authorization: Bearer <key>" or "X-API-Key: <key>".' });
+    try { return json(res, 200, erp.receive(await readJson(req, 30e6))); } catch (e) { return json(res, 400, { error: e.message }); }
+  }
+  if (p === '/api/erp/orders' && m === 'GET') {
+    if (!erp.keyOk(req)) return json(res, 401, { error: 'Missing or wrong API key.' });
+    const since = +url.searchParams.get('since') || 0, st = url.searchParams.get('status') || '';
+    return json(res, 200, { orders: db.orders.filter(o => (!since || (o.addedAt || 0) >= since) && (!st || (o.status || '').toLowerCase() === st.toLowerCase())).map(o => ({ orderId: o.orderId, po: o.po || '', pr: o.pr || '', cn: o.cn || '', status: o.status || '', class: orders.classOf(o), courier: o.courier || '', customer: o.customer || '', phone: o.phone || '', company: o.company || o.organization || '', orderDate: o.orderDay || '', updated: o.updated || '', notes: o.notes || '' })) });
+  }
+  if (p === '/api/social/yt/callback' && m === 'GET') { // Google sends the browser back here after "Continue with Google"
+    const q = Object.fromEntries(url.searchParams), page = (ok, msg) => { res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' }); res.end(`<!doctype html><meta charset="utf-8"><title>YouTube</title><body style="font:16px system-ui;padding:40px;text-align:center"><h2>${ok ? '✅ ' : '⚠️ '}${String(msg).replace(/[<>&]/g, c => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;' }[c]))}</h2><p>You can close this window.</p><script>try{window.opener&&window.opener.postMessage({yt:${ok ? 'true' : 'false'}},location.origin)}catch(e){}setTimeout(function(){window.close()},1200)</script>`); };
+    try { const r = await require('./lib/ytconnect').callback(q); return page(true, 'YouTube connected: ' + r.channel); } catch (e) { return page(false, e.message); }
+  }
+  if (p === '/api/social/tt/callback' && m === 'GET' || p === '/api/social/sc/callback' && m === 'GET') { // TikTok / Snapchat send the browser back here after "Continue with ..."
+    const tt = p.includes('/tt/'), nm = tt ? 'TikTok' : 'Snapchat', q = Object.fromEntries(url.searchParams), page = (ok, msg) => { res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' }); res.end(`<!doctype html><meta charset="utf-8"><title>${nm}</title><body style="font:16px system-ui;padding:40px;text-align:center"><h2>${ok ? '✅ ' : '⚠️ '}${String(msg).replace(/[<>&]/g, c => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;' }[c]))}</h2><p>You can close this window.</p><script>try{window.opener&&window.opener.postMessage({${tt ? 'tt' : 'sc'}:${ok ? 'true' : 'false'}},location.origin)}catch(e){}setTimeout(function(){window.close()},1200)</script>`); };
+    try { const r = await require(tt ? './lib/tiktok' : './lib/snapconnect').callback(q); return page(true, nm + ' connected: ' + r.name); } catch (e) { return page(false, e.message); }
+  }
+  if (p === '/api/social/fb/callback' && m === 'GET') { // Facebook sends the browser back here after "Continue with Facebook"
+    const q = Object.fromEntries(url.searchParams), page = (ok, msg, state) => { res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' }); res.end(`<!doctype html><meta charset="utf-8"><title>Facebook</title><body style="font:16px system-ui;padding:40px;text-align:center"><h2>${ok ? '✅ ' : '⚠️ '}${String(msg).replace(/[<>&]/g, c => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;' }[c]))}</h2><p>You can close this window.</p><script>try{window.opener&&window.opener.postMessage({fb:${ok ? 'true' : 'false'},state:${JSON.stringify(state || '')}},location.origin)}catch(e){}setTimeout(function(){window.close()},1200)</script>`); };
+    try { const r = await require('./lib/fbconnect').callback(q); return page(true, r.pages === 1 ? 'Facebook Page connected' : 'Signed in. Go back to the desk and choose your Page.', r.state); } catch (e) { return page(false, e.message, ''); }
+  }
+  const me = p === '/api/login' || p === '/api/public' ? null : auth(req, url);
+  if (!me && p !== '/api/login' && p !== '/api/public') return json(res, 401, { error: 'Please sign in again' });
+  const admin = me && me.role === 'admin';
+  const need = () => { if (!admin) { json(res, 403, { error: 'Admins only' }); return false; } return true; };
+
+  if (p === '/api/public' && m === 'GET') return json(res, 200, { business: db.settings.businessName, live: wa.connected(), login: loginpage.clean(db.settings.loginPage), defaults: loginpage.DEFAULTS }); // no list of people on the sign-in page
+  if (p === '/api/login' && m === 'POST') {
+    const b = await readJson(req), ip = req.socket.remoteAddress || '', un = auth0.normUser(b.username), wait = auth0.locked(ip, un);
+    if (wait) return json(res, 429, { error: `Too many wrong attempts. Try again in ${wait} minute${wait > 1 ? 's' : ''}.` });
+    const a = auth0.byUsername(un), good = auth0.verify(b.password, a ? a.pwd : 'scrypt$00$00'); // same work whether or not the username exists
+    if (!a || !good) { auth0.fail(ip, un); return json(res, 401, { error: 'Wrong username or password' }); }
+    auth0.ok(ip, un); return json(res, 200, { token: makeToken(a), me: { ...pub(a), username: a.username } });
+  }
+  if (p === '/api/events') {
+    res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
+    res.me = me; res.write('retry: 3000\n\n'); clients.add(res); req.on('close', () => clients.delete(res)); return;
+  }
+  if (p === '/api/bootstrap' && m === 'GET') {
+    return json(res, 200, {
+      me: { ...pub(me), username: me.username, hiddenNav: me.hiddenNav || [] }, ownOnly: !admin && ownOnly(), live: wa.connected(), mode: wa.mode(), callsApi: wa.callsOn(), webhookPath: '/webhook', verifyToken: admin ? cfg.verifyToken : undefined,
+      agents: db.agents.map(a => ({ ...pub(a), ...(admin ? { username: a.username } : {}), load: Object.values(db.conversations).filter(c => c.agentId === a.id && c.status === 'assigned').length })),
+      organizations: db.organizations, settings: publicSettings(),
+      conversations: Object.values(db.conversations).filter(c => canSeeConv(me, c)).sort((a, b) => b.updatedAt - a.updatedAt),
+      retailRegionList: admin ? retail.R().regions.map(g => ({ code: g.code, name: g.name })) : undefined,
+      orderCount: db.orders.length,
+    });
+  }
+
+  // a team member types a phone number and starts a WhatsApp chat (optionally with a first message); the chat becomes theirs
+  if (p === '/api/conversations/new' && m === 'POST') {
+    const b = await readJson(req); let d = String(b.phone || '').replace(/\D/g, ''); if (d.startsWith('00')) d = d.slice(2); if (d.startsWith('0') && d.length === 11) d = '92' + d.slice(1);
+    if (d.length < 8 || d.length > 15) return json(res, 400, { error: 'Enter the full number with the country code, e.g. 92 300 1234567' });
+    const ex = db.conversations[d]; if (ex && !canSeeConv(me, ex)) return json(res, 403, { error: 'This number is already being handled by another team member.' });
+    const conv = bot.getConv(d, String(b.name || '').trim().slice(0, 80)), nm = String(b.name || '').trim().slice(0, 80); if (nm && ex && ex.name === ex.phone) conv.name = nm;
+    if (!conv.agentId || conv.status === 'bot' || conv.status === 'waiting') { conv.agentId = me.id; conv.status = 'assigned'; conv.stage = 'human'; } else if (conv.status === 'resolved' && conv.agentId === me.id) conv.status = 'assigned';
+    store.save(); bot.emitConv(conv);
+    const text = String(b.text || '').trim();
+    if (text) { try { await bot.agentSend(d, me, text); } catch (e) { return json(res, 502, { error: e.message, phone: d }); } }
+    return json(res, 200, { ok: true, phone: d });
+  }
+  let mt;
+  if ((mt = p.match(/^\/api\/conversations\/(\d+)\/(messages|send|send-media|delete-messages|forward|assign|resolve|read|reopen|suggest|ai-draft|ai-ask)$/))) {
+    const phone = mt[1], act = mt[2], conv = db.conversations[phone];
+    if (!conv || !canSeeConv(me, conv)) return json(res, 404, { error: 'Conversation not found' });
+    // WhatsApp groups: the assigned team member may only read, send messages / files / voice notes and start the voice call.
+    // Assigning, resolving, deleting, forwarding and the AI helper are for the administrator.
+    if (conv.isGroup && !admin && !['messages', 'send', 'send-media', 'read'].includes(act)) return json(res, 403, { error: 'Only an administrator can do this in a WhatsApp group. You can chat and call in it.' });
+    if (conv.isGroup && act === 'messages') return json(res, 200, { messages: db.messages.filter(x => x.phone === phone).slice(-300), orders: [], suggestion: null, handler: null });
+    if (conv.isGroup && act === 'suggest') return json(res, 200, { suggestion: null });
+    if (act === 'messages') return json(res, 200, { messages: db.messages.filter(x => x.phone === phone).slice(-300), orders: orders.findByPhone(phone), suggestion: track.suggestion(conv), handler: conv.orgName ? track.handlerOf(conv.orgName) : null });
+    if (act === 'suggest') return json(res, 200, { suggestion: track.suggestion(conv) });
+    if (act === 'ai-draft') { try { return json(res, 200, await ai.draftReply(conv)); } catch (e) { return json(res, 502, { error: e.message }); } }
+    if (act === 'ai-ask') { const b = await readJson(req); try { return json(res, 200, await ai.ask(conv, b.question)); } catch (e) { return json(res, 502, { error: e.message }); } }
+    if (act === 'read') { conv.unread = 0; store.save(); bot.emitConv(conv); return json(res, 200, { ok: true }); }
+    if (act === 'send') {
+      const b = await readJson(req); if (!String(b.text || '').trim()) return json(res, 400, { error: 'Message is empty' });
+      try { await bot.agentSend(phone, me, String(b.text).trim()); return json(res, 200, { ok: true }); }
+      catch (e) { return json(res, 502, { error: e.message }); }
+    }
+    if (act === 'send-media' && m === 'POST') { // raw file in the body: a recorded voice note, a picture, a document ...
+      let buf; try { buf = await readBody(req, 24e6); } catch (e) { return json(res, 413, { error: 'That file is too large' }); }
+      if (!buf.length) return json(res, 400, { error: 'The file is empty' });
+      const q = url.searchParams, mime = String(req.headers['content-type'] || 'application/octet-stream');
+      try { await bot.agentSendMedia(phone, me, { buf, mime, filename: String(q.get('name') || '').slice(0, 120), caption: String(q.get('caption') || '').slice(0, 1000), voice: q.get('voice') === '1', secs: +q.get('secs') || 0 }); return json(res, 200, { ok: true }); }
+      catch (e) { return json(res, 502, { error: e.message }); }
+    }
+    if (act === 'delete-messages' && m === 'POST') { // removes messages from the desk only (WhatsApp cannot recall them)
+      const b = await readJson(req), ids = new Set((Array.isArray(b.ids) ? b.ids : []).map(String));
+      const mine = db.messages.filter(x => x.phone === phone && ids.has(x.id));
+      if (!mine.length) return json(res, 200, { deleted: 0 });
+      if (!admin && mine.some(x => x.dir !== 'out')) return json(res, 403, { error: 'Only an administrator can delete messages received from customers.' });
+      return json(res, 200, { deleted: bot.deleteMessages(phone, mine.map(x => x.id)) });
+    }
+    if (act === 'forward' && m === 'POST') {
+      const b = await readJson(req), to = (Array.isArray(b.to) ? b.to : []).map(String).filter(t => t !== phone && db.conversations[t] && canSeeConv(me, db.conversations[t]));
+      if (!to.length || !Array.isArray(b.ids) || !b.ids.length) return json(res, 400, { error: 'Choose the messages and at least one chat' });
+      return json(res, 200, await bot.forward(phone, b.ids.map(String), to, me));
+    }
+    if (act === 'assign') { const b = await readJson(req); if (conv.isGroup && b.agentId && !db.agents.some(a => a.id === b.agentId && a.active)) return json(res, 400, { error: 'Choose an active team member' }); try { bot.transfer(phone, b.agentId, me.name); return json(res, 200, { ok: true }); } catch (e) { return json(res, 400, { error: e.message }); } }
+    if (act === 'resolve') { await bot.resolve(phone, me.name); return json(res, 200, { ok: true }); }
+    if (act === 'reopen' && conv.isGroup) { conv.status = conv.agentId ? 'assigned' : 'waiting'; store.save(); bot.emitConv(conv); return json(res, 200, { ok: true }); }
+    if (act === 'reopen') { conv.status = 'assigned'; conv.agentId = conv.agentId || me.id; conv.stage = 'human'; conv.botOpen = false; store.save(); bot.emitConv(conv); return json(res, 200, { ok: true }); }
+  }
+
+  // files in chats (voice notes, pictures ...): served only to people who may see that chat; supports Range so audio can be scrubbed
+  if ((mt = p.match(/^\/api\/media\/([a-z0-9]+)$/)) && m === 'GET') {
+    const meta = media.meta(mt[1]); if (!meta || !fs.existsSync(media.file(meta.id))) return json(res, 404, { error: 'File not found' });
+    if (!canSeeConv(me, db.conversations[meta.phone])) return json(res, 404, { error: 'File not found' });
+    const inlineOk = /^(audio|video)\//.test(meta.mime) || /^image\/(jpeg|png|gif|webp)$/.test(meta.mime) || meta.mime === 'application/pdf';
+    const total = fs.statSync(media.file(meta.id)).size, rg = /^bytes=(\d*)-(\d*)$/.exec(req.headers.range || '');
+    const h = { 'Content-Type': inlineOk ? meta.mime : 'application/octet-stream', 'Content-Disposition': `${inlineOk && url.searchParams.get('dl') !== '1' ? 'inline' : 'attachment'}; filename*=UTF-8''${encodeURIComponent(meta.name)}`, 'X-Content-Type-Options': 'nosniff', 'Cache-Control': 'private, max-age=86400', 'Accept-Ranges': 'bytes', 'Content-Security-Policy': "sandbox; default-src 'none'; media-src 'self'; img-src 'self'" };
+    if (rg && total) { let a = rg[1] === '' ? Math.max(0, total - +rg[2]) : +rg[1], b = rg[1] === '' || rg[2] === '' ? total - 1 : Math.min(+rg[2], total - 1); if (a > b || a >= total) { res.writeHead(416, { 'Content-Range': `bytes */${total}` }); return res.end(); } res.writeHead(206, { ...h, 'Content-Range': `bytes ${a}-${b}/${total}`, 'Content-Length': b - a + 1 }); return fs.createReadStream(media.file(meta.id), { start: a, end: b }).pipe(res); }
+    res.writeHead(200, { ...h, 'Content-Length': total }); return fs.createReadStream(media.file(meta.id)).pipe(res);
+  }
+
+  // WhatsApp voice calls (Cloud API Calling; the browser carries the audio)
+  if (p === '/api/calls' && m === 'POST') {
+    const b = await readJson(req), phone = cleanPhone(b.phone), cv = db.conversations[phone] || { phone };
+    if (!canSeeConv(me, db.conversations[phone])) return json(res, 404, { error: 'Chat not found' });
+    try { return json(res, 200, await calls.start(phone, String(b.sdp || ''), me)); } catch (e) { return json(res, 400, { error: e.message, code: e.code }); }
+  }
+  if (p === '/api/calls/permission' && m === 'POST') { try { return json(res, 200, await calls.askPermission(cleanPhone((await readJson(req)).phone))); } catch (e) { return json(res, 400, { error: e.message }); } }
+  if (p === '/api/calls/enable' && m === 'POST') { if (!need()) return; try { await calls.enable(); return json(res, 200, { ok: true }); } catch (e) { return json(res, 400, { error: e.message }); } }
+  if ((mt = p.match(/^\/api\/calls\/([\w.=-]+)\/(accept|reject|terminate)$/)) && m === 'POST') {
+    try { const b = await readJson(req); return json(res, 200, mt[2] === 'accept' ? await calls.accept(mt[1], String(b.sdp || '')) : mt[2] === 'reject' ? await calls.reject(mt[1]) : await calls.terminate(mt[1])); } catch (e) { return json(res, 400, { error: e.message, code: e.code }); }
+  }
+
+  // voice calls without the API (browser to browser): invite a customer, answer, hang up
+  if (p === '/api/webcall/config' && m === 'GET') return json(res, 200, { ice: webcall.iceServers() });
+  if (p === '/api/webcall/invite' && m === 'POST') {
+    const b = await readJson(req), phone = cleanPhone(b.phone), conv = db.conversations[phone];
+    if (!conv || !canSeeConv(me, conv)) return json(res, 404, { error: 'Chat not found' });
+    try { const origin = links.baseUrl(String(b.origin || `http://${req.headers.host}`)); const r = await webcall.invite(conv, me, origin); return json(res, 200, { ...r, local: !/^https:\/\/[a-z0-9-]+(\.[a-z0-9-]+)+(\/|$)/i.test(shortlinksBase(origin)) }); } catch (e) { return json(res, 400, { error: e.message }); }
+  }
+  if (p === '/api/webcall/cancel' && m === 'POST') { const cv = db.conversations[cleanPhone((await readJson(req)).phone)]; if (cv && canSeeConv(me, cv)) webcall.cancel(cv); return json(res, 200, { ok: true }); }
+  if ((mt = p.match(/^\/api\/webcall\/([a-f0-9]+)\/(answer|end)$/)) && m === 'POST') {
+    const r = webcall.roomOf(mt[1]), cv = r && db.conversations[r.phone]; if (!r || !canSeeConv(me, cv)) return json(res, 404, { error: 'This call has already ended.' });
+    try { return json(res, 200, mt[2] === 'answer' ? webcall.answer(mt[1], String((await readJson(req)).sdp || ''), me) : webcall.end(mt[1], 'agent')); } catch (e) { return json(res, 400, { error: e.message }); }
+  }
+
+  // WhatsApp groups (administrator): every group the linked number is in, and which team member looks after each
+  if (p === '/api/groups' && m === 'GET') {
+    if (!need()) return;
+    let phoneGroups = []; try { phoneGroups = await link.listGroups(); } catch { /* not connected: show the groups we already know */ }
+    return json(res, 200, { connected: link.connected(), linkMode: wa.mode() === 'link', enabled: link.settings().groups !== false, groups: bot.groupList(phoneGroups) });
+  }
+  if ((mt = p.match(/^\/api\/groups\/(\d+)\/assign$/)) && m === 'POST') {
+    if (!need()) return;
+    const b = await readJson(req), jid = String(b.jid || '');
+    if (b.agentId && !db.agents.some(a => a.id === b.agentId && a.active)) return json(res, 400, { error: 'Choose an active team member' });
+    try { bot.ensureGroup(mt[1], jid, String(b.name || '')); bot.transfer(mt[1], b.agentId || '', me.name); return json(res, 200, { ok: true }); } catch (e) { return json(res, 400, { error: e.message }); }
+  }
+
+  // Quotations: the administrator manages every company and the letterhead. A team member can only make, edit and send quotations
+  // for the companies the administrator assigned to them (and cannot change company details or the letterhead).
+  const myCos = () => admin ? quotes.companyList() : quotes.companyList().filter(c => (c.assigned || []).includes(me.id)).map(c => ({ ...c, assigned: undefined }));
+  const coOk = id => admin || (!!id && ((quotes.getCompany(id) || {}).assigned || []).includes(me.id));
+  const qOk = q => admin || coOk(q.companyId);
+  const NOPE = { error: 'This company is not assigned to you. Ask the administrator.' }, ADM = { error: 'Only the administrator can change companies and the letterhead.' };
+  const memberBody = b => { if (!admin) { delete b.head; if (!coOk(b.companyId)) return false; } return true; };
+  const blankFor = c => { const mine = myCos(); return quotes.blank(admin ? c : (mine.some(x => x.id === c) ? c : (mine[0] || {}).id || '')); };
+  // ---- DC files section: DCs with their companies, links, uploaded sheets and tracked items ----
+  if (p.startsWith('/api/dcfiles')) {
+    const mineCo = name => { if (admin) return true; const g = track.orgFor(name); return !!(g && (g.agentId === me.id || g.backupAgentId === me.id)); };
+    const can = r => !!r && mineCo(r.company), NO = { error: 'This DC is not in a company assigned to you.' };
+    const companiesList = () => { const set = new Set([...(db.organizations || []).map(o => o.name), ...db.orders.map(o => o.organization || o.company), ...dcfiles.all().map(r => r.company)].filter(Boolean)); return [...set].filter(mineCo).sort((a, b) => a.localeCompare(b)); };
+    let mm;
+    try {
+      if (p === '/api/dcfiles' && m === 'GET') return json(res, 200, { dcs: dcfiles.all().filter(can).map(dcfiles.row).sort((a, b) => b.updatedAt - a.updatedAt), companies: companiesList() });
+      if (p === '/api/dcfiles' && m === 'POST') { const b = await readJson(req, 8e6); if (!mineCo(String(b.company || ''))) return json(res, 403, NO); const r = dcfiles.create(b, me.name); if (Array.isArray(b.links) && b.links.length) { const x = await dcfiles.addLinks(r.id, b.links, me.name); if (!r.items.length && x.items.length) dcfiles.update(r.id, { items: x.items }); } return json(res, 200, dcfiles.view(r)); }
+      if ((mm = p.match(/^\/api\/dcfiles\/file\/([\w-]+)$/))) {
+        const r = dcfiles.ownerOfFile(mm[1]); if (!can(r)) return json(res, 404, { error: 'File not found.' });
+        if (m === 'GET') { const d = dcfiles.readFile(mm[1]); res.writeHead(200, { 'Content-Type': d.type, 'Content-Disposition': `inline; filename="${d.name.replace(/"/g, '')}"` }); return res.end(d.buf); }
+        if (m === 'DELETE') { dcfiles.removeFile(mm[1]); return json(res, 200, { ok: true }); }
+      }
+      if ((mm = p.match(/^\/api\/dcfiles\/(d_\w+)(?:\/(links|files)(?:\/(l_\w+))?)?$/))) {
+        const r = dcfiles.get(mm[1]); if (!r) return json(res, 404, { error: 'DC not found.' }); if (!can(r)) return json(res, 403, NO);
+        if (!mm[2]) {
+          if (m === 'GET') return json(res, 200, dcfiles.view(r));
+          if (m === 'PUT') { const b = await readJson(req, 8e6); if (b.company !== undefined && !mineCo(String(b.company))) return json(res, 403, NO); return json(res, 200, dcfiles.view(dcfiles.update(r.id, b))); }
+          if (m === 'DELETE') { dcfiles.remove(r.id); return json(res, 200, { ok: true }); }
+        }
+        if (!mm[2] && m === 'POST') { dcfiles.rescan(r); return json(res, 200, dcfiles.view(r)); }
+        if (mm[2] === 'links' && m === 'POST') { const b = await readJson(req); const x = await dcfiles.addLinks(r.id, b.urls, me.name); return json(res, 200, { ...x, dc: dcfiles.view(r) }); }
+        if (mm[2] === 'links' && m === 'DELETE' && mm[3]) return json(res, 200, dcfiles.view(dcfiles.removeLink(r.id, mm[3])));
+        if (mm[2] === 'files' && m === 'POST') { let buf; try { buf = await readBody(req, 16e6); } catch { return json(res, 413, { error: 'The file is larger than 15 MB.' }); } const name = url.searchParams.get('name') || 'file'; dcfiles.addFile(r.id, name, buf, me.name); const ext = (name.split('.').pop() || '').toLowerCase(); const items = ['xlsx', 'xlsm', 'csv'].includes(ext) ? dcitems.clean(dcitems.parseFile(buf, name).map(i => ({ ...i, status: 'pending' }))) : []; return json(res, 200, { items, dc: dcfiles.view(r) }); }
+      }
+    } catch (e) { return json(res, 400, { error: e.message }); }
+    return json(res, 404, { error: 'Not found' });
+  }
+  if (p === '/api/quotes' && m === 'GET') return json(res, 200, { quotes: quotes.list().filter(r => admin || coOk(r.companyId)), cfg: quotes.getCfg(), blank: blankFor(url.searchParams.get('company') || ''), companies: myCos(), mailReady: !!reports.effectiveCfg(), waMode: wa.mode() });
+  if (p === '/api/quotes' && m === 'POST') { try { const b = await readJson(req, 8e6); if (!memberBody(b)) return json(res, 403, NOPE); return json(res, 200, quotes.save(null, b, me.name)); } catch (e) { return json(res, 400, { error: e.message }); } }
+  if (p === '/api/quotes/companies' && m === 'GET') return json(res, 200, myCos());
+  if (p === '/api/quotes/companies' && m === 'POST') { if (!admin) return json(res, 403, ADM); try { return json(res, 200, quotes.saveCompany(null, await readJson(req, 8e6))); } catch (e) { return json(res, 400, { error: e.message }); } }
+  if ((mt = p.match(/^\/api\/quotes\/companies\/(c_[a-f0-9]+)$/))) {
+    if (!quotes.getCompany(mt[1])) return json(res, 404, { error: 'Company not found' });
+    if (!admin) return json(res, 403, ADM);
+    if (m === 'PUT') { try { return json(res, 200, quotes.saveCompany(mt[1], await readJson(req, 8e6))); } catch (e) { return json(res, 400, { error: e.message }); } }
+    if (m === 'DELETE') { quotes.removeCompany(mt[1]); return json(res, 200, { ok: true }); }
+  }
+  if (p === '/api/quotes/blank' && m === 'GET') return json(res, 200, blankFor(url.searchParams.get('company') || ''));
+  if (p === '/api/quotes/cfg' && m === 'PUT') { if (!admin) return json(res, 403, ADM); try { return json(res, 200, quotes.setCfg(await readJson(req, 8e6))); } catch (e) { return json(res, 400, { error: e.message }); } }
+  if (p === '/api/quotes/preview' && m === 'POST') { // a PDF of the form as it is on screen, before it is saved
+    try { const b = await readJson(req, 8e6); if (!memberBody(b)) return json(res, 403, NOPE); const buf = quotes.pdf(quotes.clean(b, null)); res.writeHead(200, { 'Content-Type': 'application/pdf', 'Content-Length': buf.length, 'Cache-Control': 'no-store' }); return res.end(buf); }
+    catch (e) { return json(res, 400, { error: e.message }); }
+  }
+  if ((mt = p.match(/^\/api\/quotes\/(q_[a-f0-9]+)(?:\/(pdf|email|whatsapp|duplicate|marksent))?$/))) {
+    const q = quotes.get(mt[1]); if (!q) return json(res, 404, { error: 'Quotation not found' });
+    if (!qOk(q)) return json(res, 403, NOPE);
+    const act = mt[2];
+    if (!act && m === 'GET') return json(res, 200, q);
+    if (!act && m === 'PUT') { try { const b = await readJson(req, 8e6); if (!admin) b.companyId = q.companyId; if (!memberBody(b)) return json(res, 403, NOPE); return json(res, 200, quotes.save(q.id, b, me.name)); } catch (e) { return json(res, 400, { error: e.message }); } }
+    if (!act && m === 'DELETE') { if (!admin && q.by && q.by !== me.name) return json(res, 403, { error: 'Only the person who made this quotation, or an administrator, can delete it.' }); quotes.remove(q.id); return json(res, 200, { ok: true }); }
+    if (act === 'marksent' && m === 'POST') { const b = await readJson(req); quotes.markSent(q.id, 'email', String(b.to || '').slice(0, 300), me.name); return json(res, 200, { ok: true }); }
+    if (act === 'duplicate' && m === 'POST') return json(res, 200, quotes.duplicate(q.id, me.name));
+    if (act === 'pdf' && m === 'GET') {
+      const buf = quotes.pdf(q), name = quotes.fileName(q), dl = url.searchParams.get('download') === '1';
+      res.writeHead(200, { 'Content-Type': 'application/pdf', 'Content-Length': buf.length, 'Content-Disposition': `${dl ? 'attachment' : 'inline'}; filename="${name}"`, 'Cache-Control': 'no-store' }); return res.end(buf);
+    }
+    if (act === 'email' && m === 'POST') {
+      const b = await readJson(req), split = v => String(v || '').split(/[;,\s]+/).map(x => x.trim()).filter(Boolean), bad = x => !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(x);
+      const to = split(b.to), cc = split(b.cc);
+      if (!to.length) return json(res, 400, { error: 'Type the email address to send the quotation to.' });
+      const wrong = [...to, ...cc].find(bad); if (wrong) return json(res, 400, { error: `"${wrong}" is not a valid email address.` });
+      const sg = signature.block(me), eh = x => String(x).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+      const message = String(b.message || '').slice(0, 5000), subject = String(b.subject || '').slice(0, 200) || `Quotation ${q.no}`;
+      try {
+        await reports.sendMail({ to, cc, subject, text: message + (sg ? sg.text : ''), html: `<div style="font-family:Arial,sans-serif;font-size:14px;color:#222;white-space:pre-wrap">${eh(message)}</div>${sg ? sg.html : ''}`, inline: sg ? sg.inline : [], attachments: [{ filename: quotes.fileName(q), type: 'application/pdf', content: quotes.pdf(q) }] });
+        quotes.markSent(q.id, 'email', [...to, ...cc].join(', '), me.name); return json(res, 200, { ok: true });
+      } catch (e) { return json(res, 502, { error: e.message }); }
+    }
+    if (act === 'whatsapp' && m === 'POST') {
+      const b = await readJson(req); let phone = cleanPhone(b.phone);
+      if (phone.startsWith('00')) phone = phone.slice(2); else if (/^0\d{10}$/.test(phone)) phone = '92' + phone.slice(1); // 0300 1234567 -> 92300 1234567 (Pakistan)
+      if (phone.length < 8 || phone.length > 15) return json(res, 400, { error: 'Type the WhatsApp number with the country code, e.g. 923001234567.' });
+      if (wa.mode() === 'demo') return json(res, 400, { error: 'WhatsApp is not connected yet. Open Settings → WhatsApp connection and link your number, or download the PDF and send it yourself.' });
+      const o = { buf: quotes.pdf(q), mime: 'application/pdf', filename: quotes.fileName(q), caption: String(b.caption || '').slice(0, 1000) };
+      try {
+        if (db.conversations[phone]) await bot.agentSendMedia(phone, me, o); else await bot.autoSendMedia(phone, String(q.toLines || '').split('\n')[1] || String(q.toLines || '').split('\n')[0] || phone, o);
+        quotes.markSent(q.id, 'whatsapp', '+' + phone, me.name); return json(res, 200, { ok: true, phone });
+      } catch (e) { return json(res, 502, { error: e.message }); }
+    }
+  }
+
+  // WhatsApp links (admin): public forms that send customers to WhatsApp and route them to the right person
+  if (p === '/api/links' && m === 'GET') { if (!need()) return; return json(res, 200, { links: links.list(), cfg: links.cfgView(), mode: wa.mode(), apiOn: wa.apiOn(), apiKeys: wa.hasApiKeys(), callsApi: wa.callsOn() }); }
+  if (p === '/api/links' && m === 'POST') { if (!need()) return; try { return json(res, 200, links.save(null, await readJson(req))); } catch (e) { return json(res, 400, { error: e.message }); } }
+  if (p === '/api/links/config' && m === 'PUT') { if (!need()) return; return json(res, 200, links.setCfg(await readJson(req))); }
+  if ((mt = p.match(/^\/api\/links\/(l_[a-f0-9]+)(\/qr)?$/))) {
+    if (!need()) return;
+    if (mt[2] && m === 'GET') { try { const L = links.list().find(x => x.id === mt[1]); if (!L) return json(res, 404, { error: 'Link not found' }); return json(res, 200, { qr: await require('qrcode').toDataURL(`${links.baseUrl(url.searchParams.get('origin') || `http://${req.headers.host}`)}/go/${L.slug}`, { margin: 1, width: 320 }) }); } catch (e) { return json(res, 400, { error: 'QR codes need the "qrcode" package (npm install).' }); } }
+    if (m === 'PUT') { try { return json(res, 200, links.save(mt[1], await readJson(req))); } catch (e) { return json(res, 400, { error: e.message }); } }
+    if (m === 'DELETE') { links.remove(mt[1]); return json(res, 200, { ok: true }); }
+  }
+
+  // link your phone's WhatsApp number (QR code / pairing code), like WhatsApp Web
+  if (p === '/api/wa' && m === 'GET') { if (!need()) return; return json(res, 200, waStatus()); }
+  if (p === '/api/wa/link' && m === 'POST') { if (!need()) return; try { const b = await readJson(req); await link.link({ method: b.method === 'code' ? 'code' : 'qr', phone: b.phone }); return json(res, 200, waStatus()); } catch (e) { return json(res, 400, { error: e.message }); } }
+  if (p === '/api/wa/reconnect' && m === 'POST') { if (!need()) return; try { await link.reconnect(); return json(res, 200, waStatus()); } catch (e) { return json(res, 400, { error: e.message }); } }
+  if (p === '/api/wa/unlink' && m === 'POST') { if (!need()) return; try { await link.unlink(); return json(res, 200, waStatus()); } catch (e) { return json(res, 400, { error: e.message }); } }
+  if (p === '/api/wa/settings' && m === 'PUT') { if (!need()) return; link.updateSettings(await readJson(req)); return json(res, 200, waStatus()); }
+
+  // DC alerts: the administrator chooses who is told about DCs that are still pending dispatch after N days, and for which companies.
+  // GET /api/dcalerts = this person's own alert (what to show), GET/PUT /api/dcalerts/config = the rules (administrator)
+  if (p === '/api/dcalerts' && m === 'GET') { const r = dcalerts.compute(me, db, orders, groupOf); return json(res, 200, { ...r, prefs: dcalerts.prefs(me.id), at: Date.now() }); }
+  if (p === '/api/dcalerts/prefs' && m === 'PUT') return json(res, 200, { prefs: dcalerts.setPrefs(me.id, await readJson(req)) });
+  if (p === '/api/dcalerts/config' && m === 'GET') {
+    if (!need()) return;
+    const memo = new Map(), co = new Map();
+    for (const o of db.orders) { const g = groupOf(o, memo); if (!co.has(g.key)) co.set(g.key, g.name); }
+    for (const g of db.organizations || []) if (!co.has(g.id)) co.set(g.id, g.name);
+    return json(res, 200, { rules: dcalerts.rules(), companies: [...co].map(([key, name]) => ({ key, name })).sort((a, b) => a.name.localeCompare(b.name)), agents: db.agents.filter(a => a.active !== false).map(a => ({ id: a.id, name: a.name, role: a.role })) });
+  }
+  if (p === '/api/dcalerts/config' && m === 'PUT') {
+    if (!need()) return;
+    const b = await readJson(req); return json(res, 200, { rules: dcalerts.set(b.rules, new Set(db.agents.map(a => a.id))) });
+  }
+
+  // find a PO / P.R / CN number -> order details + who to call
+  if (p === '/api/track/search' && m === 'GET') {
+    const q = url.searchParams.get('q') || '', flt = orderFilter(url.searchParams), gate = orderGate(me), allow = flt ? o => gate(o) && flt(o) : gate;
+    const withChat = r => ({ ...r, chat: db.conversations[r.customerPhone] && canSeeConv(me, db.conversations[r.customerPhone]) ? { phone: r.customerPhone, status: db.conversations[r.customerPhone].status } : null });
+    const full = url.searchParams.get('all') === '1';
+    // every column header of the sheets in the result, in sheet order (the Columns menu lists them all, even empty ones)
+    const colsOf = rows => { const seen = new Set(), out = []; for (const sid of new Set(rows.map(r => r.src))) { const s = sync.get(sid); for (const h of (s && (s.allHeaders || s.headers)) || []) if (!seen.has(h)) { seen.add(h); out.push(h); } } return out; };
+    if (q.trim().length < 2) { const l = track.list(allow, full ? 5000 : 300); return json(res, 200, { results: l.rows.map(withChat), total: l.total, sheetCols: colsOf(l.rows) }); } // only filters: list the matching orders
+    { const rows = track.search(q, full ? 5000 : flt ? 300 : 50, allow); return json(res, 200, { results: rows.map(withChat), sheetCols: colsOf(rows) }); }
+  }
+  // DC files: a page of DCs (searched on the server, so every DC can be found and only 100 rows are sent at a time)
+  if (p === '/api/dcs/page' && m === 'GET') {
+    const g = k => url.searchParams.get(k) || '', flt = orderFilter(url.searchParams), gate = orderGate(me), allow = flt ? o => gate(o) && flt(o) : gate;
+    const r = track.page(allow, { q: g('q'), field: g('field'), offset: Math.max(0, +g('offset') || 0), limit: Math.min(500, Math.max(1, +g('limit') || 100)) });
+    const seen = new Set(), cols = []; for (const sid of r.srcs) { const s = sync.get(sid); for (const h of (s && (s.allHeaders || s.headers)) || []) if (!seen.has(h)) { seen.add(h); cols.push(h); } }
+    const withChat = x => ({ ...x, chat: db.conversations[x.customerPhone] && canSeeConv(me, db.conversations[x.customerPhone]) ? { phone: x.customerPhone, status: db.conversations[x.customerPhone].status } : null });
+    return json(res, 200, { results: r.rows.map(withChat), total: r.total, pool: r.pool, sheetCols: cols });
+  }
+  // printable tracking receipt (courier-style page with progress steps, timeline and a Delivered section)
+  if (p === '/api/track/events' && m === 'GET') return json(res, 200, receipt.getEvents(url.searchParams.get('cn') || ''));
+  if (p === '/api/track/events' && m === 'PUT') { const b = await readJson(req); receipt.saveEvents(b.cn, b.text, me.name); return json(res, 200, { ok: true }); }
+  if (p === '/api/track/receipt' && m === 'GET') {
+    let d = {}; try { d = JSON.parse(url.searchParams.get('d') || '{}'); } catch {}
+    if (!String(d.cn || '').trim()) return html(res, 400, '<!doctype html><meta charset=utf-8><body style="font-family:system-ui;padding:40px">Enter the CN / tracking number first.</body>');
+    // live: ask the courier's own tracking page first, so the printed page shows what the courier shows right now
+    let note = null;
+    if (d.live !== false) {
+      const L = await livetrack.fetchLive({ cn: d.cn, courier: d.courier, url: d.url, fresh: true });
+      if (L.ok) {
+        for (const [k, v] of Object.entries(L.fields)) if (v && !/^[-–—]+$/.test(String(v).trim())) d[k] = v;
+        if (L.events.length) { d.events = livetrack.eventsText(L.events); receipt.saveEvents(d.cn, d.events, me.name); }
+        note = { ok: true, text: 'Live from the courier — ' + new Date().toLocaleString('en-GB') };
+      } else note = { ok: false, text: 'Live tracking could not be read: ' + L.error + ' Showing the saved details instead.' };
+    }
+    return html(res, 200, receipt.render(d, note));
+  }
+  if (p === '/api/track/live' && m === 'GET') {
+    const L = await livetrack.fetchLive({ cn: url.searchParams.get('cn'), courier: url.searchParams.get('courier'), url: url.searchParams.get('url'), fresh: url.searchParams.get('fresh') === '1' });
+    return json(res, 200, { ...L, eventsText: L.ok ? livetrack.eventsText(L.events) : '' });
+  }
+  // the DC list of the current Overview / Find PO filters as a PDF or an Excel file
+  if (p === '/api/orders/export' && m === 'GET') {
+    const q = (url.searchParams.get('q') || '').trim(), flt = orderFilter(url.searchParams), gate = orderGate(me), allow = flt ? o => gate(o) && flt(o) : gate;
+    const rows = q.length >= 2 ? track.search(q, 5000, allow) : track.list(allow, 5000).rows;
+    const DL = { pending: 'Pending dispatch', dispatched: 'Dispatched', self: 'Self', other: 'Cancelled / returned' };
+    const cols = [{ label: 'PO no', narrow: true }, { label: 'P.R no', narrow: true }, { label: 'CN no', narrow: true }, { label: 'Company' }, { label: 'Customer' }, { label: 'Courier', narrow: true }, { label: 'Date', narrow: true }, { label: 'Dispatch', narrow: true }, { label: 'ERP billing', narrow: true }, { label: 'Status', narrow: true }];
+    let grid = rows.map(r => [r.po || r.orderId, r.pr, r.cn, r.organization || r.company, r.customer, r.courier, r.day || r.updated, DL[r.cls] || '', r.billed ? 'Billed in ERP' : 'Non billed', r.status]), widths = [];
+    // the columns picked in the DC table (which ones, their order, their widths) replace the standard layout
+    const mine = dccols.parse(url.searchParams.get('cols'));
+    if (mine) { cols.splice(0, cols.length, ...mine.map(c => ({ label: c.label, width: c.width }))); grid = rows.map(r => mine.map(c => dccols.value(r, c.key))); widths = mine.map(c => c.width); }
+    const bits = [url.searchParams.get('label') || '', url.searchParams.get('bill') === 'billed' ? 'Billed in ERP' : url.searchParams.get('bill') === 'remaining' ? 'Non billed' : '', DL[url.searchParams.get('cls')] || ''].filter(Boolean);
+    const day = new Date().toISOString().slice(0, 10), biz = db.settings.businessName || 'WhatsApp Desk', fmt = url.searchParams.get('format') === 'pdf' ? 'pdf' : 'xlsx', name = `dc-list-${day}.${fmt}`;
+    const content = fmt === 'pdf'
+      ? pdfTable({ title: 'DC list' + (bits.length ? ' - ' + bits.join(' / ') : ''), subtitle: `${biz} - ${day} - ${grid.length} DC${grid.length === 1 ? '' : 's'}`, columns: cols, rows: grid, footer: `${biz} - generated from WhatsApp Desk` })
+      : writeRows([cols.map(c => c.label), ...grid], 'DC list', [], widths);
+    res.writeHead(200, { 'Content-Type': fmt === 'pdf' ? 'application/pdf' : 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', 'Content-Disposition': `attachment; filename="${name}"` }); return res.end(content);
+  }
+  // my email signature (every team member edits only their own)
+  // my mail look (theme + background picture): every team member has their own, nobody else can see it
+  // my sidebar: each person hides the menu sections they do not use (only for themselves; the sections keep running in the background)
+  if (p === '/api/me/nav' && m === 'PUT') {
+    const b = await readJson(req); const list = Array.isArray(b.hidden) ? b.hidden : [];
+    me.hiddenNav = [...new Set(list.filter(x => typeof x === 'string' && /^[a-z]{2,20}$/.test(x) && x !== 'settings'))].slice(0, 40);
+    store.save(); return json(res, 200, { hiddenNav: me.hiddenNav });
+  }
+  if (p === '/api/me/theme' && m === 'GET') return json(res, 200, { theme: me.theme || {} });
+  if (p === '/api/me/theme' && m === 'PUT') {
+    const b = await readJson(req, 6e6), t = {};
+    if (['auto', 'light', 'dark'].includes(b.mode)) t.mode = b.mode;
+    if (/^[a-z]{3,10}$/.test(b.accent || '')) t.accent = b.accent;
+    if (/^[a-z]{2,12}$/.test(b.bg || '')) t.bg = b.bg;
+    if (['comfortable', 'cozy', 'compact'].includes(b.density)) t.density = b.density;
+    t.light = !!b.light;
+    if (typeof b.bgImg === 'string' && /^data:image\/(jpeg|png|webp);base64,[A-Za-z0-9+/=]*$/.test(b.bgImg)) { if (b.bgImg.length > 3.5e6) return json(res, 400, { error: 'That background picture is too large (max about 2.5 MB)' }); t.bgImg = b.bgImg; } else t.bgImg = '';
+    me.theme = t; store.save(); return json(res, 200, { ok: true });
+  }
+  // each person's default "From" mailbox for new messages
+  if (p === '/api/me/mail-default' && m === 'PUT') { const b = await readJson(req), id = String(b.accountId || ''); if (id && !inbox.accounts().some(a => a.id === id)) return json(res, 400, { error: 'That mailbox is not connected' }); me.mailDefault = id; store.save(); return json(res, 200, { ok: true, accountId: id }); }
+  if (p === '/api/me/signature' && m === 'GET') return json(res, 200, signature.view(me));
+  if (p === '/api/me/signature' && m === 'PUT') { try { return json(res, 200, signature.set(me, await readJson(req))); } catch (e) { return json(res, 400, { error: e.message }); } }
+  if (p === '/api/ai/config' && m === 'GET') return json(res, 200, ai.publicConfig());
+  if (p === '/api/ai/config' && m === 'PUT') { if (!need()) return; return json(res, 200, ai.setConfig(await readJson(req))); }
+
+  if (p === '/api/simulate' && m === 'POST') {
+    const b = await readJson(req); const phone = cleanPhone(b.phone);
+    if (phone.length < 7) return json(res, 400, { error: 'Enter a phone number' });
+    const L = link.settings(), lm = wa.mode() !== 'cloud'; // the Test Phone behaves like the real linked number
+    await bot.onIncoming({ phone, name: b.name || '', text: b.text || '', replyId: b.replyId, ...(lm ? { noBot: !L.autoBot, autoAssign: L.assignNew !== false } : {}) });
+    return json(res, 200, { ok: true });
+  }
+
+  // organizations
+  if (p === '/api/organizations' && m === 'POST') {
+    if (!need()) return; const b = await readJson(req);
+    if (!String(b.name || '').trim()) return json(res, 400, { error: 'Organization name is required' });
+    const o = { id: store.nextId('o'), name: b.name.trim(), aliases: (b.aliases || []).map(s => s.trim()).filter(Boolean), agentId: b.agentId || '', backupAgentId: b.backupAgentId || '', emails: (b.emails || []).map(s => s.trim().toLowerCase()).filter(Boolean) };
+    db.organizations.push(o); store.save(); return json(res, 200, o);
+  }
+  if ((mt = p.match(/^\/api\/organizations\/([\w-]+)$/))) {
+    if (!need()) return; const o = db.organizations.find(x => x.id === mt[1]); if (!o) return json(res, 404, { error: 'Not found' });
+    if (m === 'DELETE') { db.organizations = db.organizations.filter(x => x !== o); store.save(); return json(res, 200, { ok: true }); }
+    if (m === 'PATCH') { const b = await readJson(req); for (const k of ['name', 'agentId', 'backupAgentId']) if (b[k] !== undefined) o[k] = b[k]; if (b.emails) o.emails = b.emails.map(s => s.trim().toLowerCase()).filter(Boolean); if (b.aliases) o.aliases = b.aliases.map(s => s.trim()).filter(Boolean); store.save(); return json(res, 200, o); }
+  }
+
+  // team
+  if (p === '/api/agents' && m === 'POST') {
+    if (!need()) return; const b = await readJson(req);
+    const un = auth0.normUser(b.username), pw = auth0.passwordProblem(b.password);
+    if (!String(b.name || '').trim()) return json(res, 400, { error: 'Enter the person’s name' });
+    if (!auth0.validUser(un)) return json(res, 400, { error: 'Username: 3–32 letters, numbers, dot, dash or underscore (e.g. sara.khan)' });
+    if (auth0.byUsername(un)) return json(res, 400, { error: 'That username is already taken' });
+    if (pw) return json(res, 400, { error: pw });
+    const palette = ['#7c3aed', '#d97706', '#db2777', '#2563eb', '#059669', '#dc2626', '#0891b2'];
+    const a = { id: store.nextId('a'), name: b.name.trim(), username: un, pwd: auth0.hash(b.password), role: b.role === 'admin' ? 'admin' : 'agent', color: palette[db.agents.length % palette.length], active: true, phone: cleanPhone(b.phone), title: String(b.title || '').trim().slice(0, 60), retailRegions: retail.cleanCodes(b.retailRegions) };
+    db.agents.push(a); store.save(); return json(res, 200, { ...pub(a), username: a.username });
+  }
+  if ((mt = p.match(/^\/api\/agents\/([\w-]+)$/))) {
+    const a = bot.agentById(mt[1]); if (!a) return json(res, 404, { error: 'Not found' });
+    if (m === 'PATCH') {
+      if (!admin && a.id !== me.id) return json(res, 403, { error: 'Not allowed' });
+      const b = await readJson(req);
+      if (b.active !== undefined) a.active = !!b.active;
+      if (b.phone !== undefined) a.phone = cleanPhone(b.phone);
+      if (b.email !== undefined) { const em = String(b.email).trim().toLowerCase(); if (em && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(em)) return json(res, 400, { error: 'Enter a valid email address' }); a.email = em; }
+      if (b.title !== undefined) a.title = String(b.title).trim().slice(0, 60);
+      if (admin && b.retailRegions !== undefined) a.retailRegions = retail.cleanCodes(b.retailRegions); // only the administrator decides which retail regions a person sees
+      if (admin) { if (b.name) a.name = b.name; if (b.role) a.role = b.role === 'admin' ? 'admin' : 'agent'; }
+      if (b.username !== undefined && admin) { const un = auth0.normUser(b.username); if (!auth0.validUser(un)) return json(res, 400, { error: 'Username: 3–32 letters, numbers, dot, dash or underscore' }); const other = auth0.byUsername(un); if (other && other !== a) return json(res, 400, { error: 'That username is already taken' }); a.username = un; }
+      let newToken;
+      if (b.password) {
+        const pw = auth0.passwordProblem(b.password); if (pw) return json(res, 400, { error: pw });
+        if (!admin || a.id === me.id) { if (!auth0.verify(b.currentPassword, a.pwd)) return json(res, 400, { error: 'Your current password is not correct' }); } // changing your own password needs the old one
+        a.pwd = auth0.hash(b.password); if (a.id === me.id) newToken = makeToken(a); // others are signed out; you stay signed in
+      }
+      store.save(); return json(res, 200, { ...pub(a), ...(admin || a.id === me.id ? { username: a.username } : {}), token: newToken });
+    }
+    if (m === 'DELETE') {
+      if (!need()) return; if (a.id === me.id) return json(res, 400, { error: "You can't delete yourself" });
+      db.agents = db.agents.filter(x => x !== a);
+      for (const c of Object.values(db.conversations)) if (c.agentId === a.id) { c.agentId = null; c.status = 'waiting'; }
+      for (const o of db.organizations) { if (o.agentId === a.id) o.agentId = ''; if (o.backupAgentId === a.id) o.backupAgentId = ''; }
+      store.save(); return json(res, 200, { ok: true });
+    }
+  }
+
+  // orders / tracking sheets (one sheet per company, e.g. BAFL; customers can search all of them)
+  if (p === '/api/orders' && m === 'GET') return json(res, 200, { orders: db.orders.filter(orderGate(me)).map(o => ({ ...o, trackUrl: orders.isUrl(o.link) ? o.link : orders.trackUrl(o) })) });
+  if (p === '/api/orders/summary' && m === 'GET') { // per company: how many are dispatched / self / pending in the chosen days (small, so the Overview opens fast)
+    // the days are the ones written in each sheet's DC date / order date column (not the moment the sheet was synced)
+    const gate = orderGate(me), isDay = v => /^\d{4}-\d{2}-\d{2}$/.test(v || ''), from = isDay(url.searchParams.get('from')) ? url.searchParams.get('from') : '', to = isDay(url.searchParams.get('to')) ? url.searchParams.get('to') : '', ranged = !!(from || to), dfrom = isDay(url.searchParams.get('dfrom')) ? url.searchParams.get('dfrom') : '', dto = isDay(url.searchParams.get('dto')) ? url.searchParams.get('dto') : '', dranged = !!(dfrom || dto);
+    const mkG = base => ({ key: base.key, orgId: base.key.startsWith('x:') ? '' : base.key, name: base.name, agentId: base.agentId, backupAgentId: base.backupAgentId, total: 0, c: { dispatched: 0, self: 0, pending: 0, other: 0, billed: 0, remaining: 0 }, x: { dc: {}, po: {} }, _po: {}, noDate: false });
+    const G = new Map(), memo = new Map(), noDate = new Set(), srcById = new Map(sync.list().map(s => [s.id, s])); let undated = 0, undatedD = 0;
+    for (const o of db.orders) {
+      if (!gate(o)) continue;
+      if (ranged) { const d = o.orderDay || ''; if (!d) { undated++; continue; } if ((from && d < from) || (to && d > to)) continue; }
+      if (dranged) { const ds = orders.dispatchDaysOf(o); if (!ds.length) { undatedD++; continue; } if (!ds.some(d => (!dfrom || d >= dfrom) && (!dto || d <= dto))) continue; }   // Dispatch date column
+      const base = groupOf(o, memo); let g = G.get(base.key); if (!g) G.set(base.key, g = mkG(base));
+      g.total++; const cl = orders.classOf(o); g.c[cl]++; if (cl === 'dispatched' || cl === 'self') g.parcels = (g.parcels || 0) + (parseInt(o.parcelCount, 10) || 0);   // parcels that already left if (cl !== 'other') g.c[orders.billedOf(o) ? 'billed' : 'remaining']++;
+      // DC count and DISTINCT PO count for every filter combination (dispatch group x ERP billing), so the Overview cards can follow the filters
+      { const bl = orders.billedOf(o) ? 'billed' : 'remaining', po = orders.normId(o.po);
+        for (const c1 of (cl === 'other' ? ['', 'other'] : ['', cl])) for (const b1 of (cl === 'other' ? [''] : ['', bl])) { const k = c1 + '|' + b1; g.x.dc[k] = (g.x.dc[k] || 0) + 1; if (po) (g._po[k] = g._po[k] || new Set()).add(po); } }
+      const src = srcById.get(o.src); if (src && src.hasDate === false) g.noDate = true;
+    }
+    // companies with no order in the chosen days are still listed (with zeros) so the company drop-down is always complete
+    for (const o of db.orders) { if (!gate(o)) continue; const base = groupOf(o, memo); if (!G.has(base.key)) G.set(base.key, mkG(base)); }
+    for (const g of G.values()) { for (const [k, set] of Object.entries(g._po)) g.x.po[k] = set.size; delete g._po; }
+    return json(res, 200, { groups: [...G.values()], undated, ranged, undatedD, dranged });
+  }
+  if (p === '/api/sources' && m === 'GET') return json(res, 200, { sources: sync.list().filter(s => srcGate(me, s)).map(s => { const v = sync.view(s); return admin ? v : { ...v, url: '', lastError: '' }; }), ms: admin ? ms.publicStatus() : { signedIn: ms.signedIn() }, scan: admin ? require('./lib/scanhook').status() : null });
+  // Team -> Company sheets: the OneDrive / SharePoint link of each company sheet. Admin gets every sheet; a team member only the
+  // sheets of companies assigned to them (same gate as Order tracking). Local file paths are never sent, only web links.
+  if (p === '/api/sheet-links' && m === 'GET') {
+    const orgOf = s => { const g = track.orgFor(s.name); return g ? g.name : s.name; };
+    return json(res, 200, { admin, sheets: sync.list().filter(s => srcGate(me, s)).map(s => ({ id: s.id, name: s.name, company: orgOf(s), orders: db.orders.filter(o => o.src === s.id).length, lastSync: s.lastSync || 0, link: /^https?:\/\//i.test(s.url || '') ? s.url : '', itemLink: ((itemidx.sheetFor(s.name, orgOf(s)) || {}).link) || '', itemName: ((itemidx.sheetFor(s.name, orgOf(s)) || {}).name) || '' })) });
+  }
+  // Scan backup (administrator): what the ScanSheet app saved, compared with the company sheets. Not part of any order count.
+  if (p === '/api/scan/log' && m === 'GET') { if (!need()) return; const l = require('./lib/scanhook').list(), n = k => l.filter(x => x.state === k).length; return json(res, 200, { entries: l.slice(0, 3000), total: l.length, counts: { ok: n('ok'), missing: l.filter(x => x.state === 'missing' && !x.skip).length, differs: n('differs'), nocn: n('nocn'), excluded: l.filter(x => x.skip).length }, dir: require('./lib/scanhook').backupDir() }); }
+  if (p === '/api/scan/fix' && m === 'POST') { if (!need()) return; const r = await require('./lib/scanhook').autoFix(true); return json(res, 200, { ...r, ...require('./lib/scanhook').fixStatus() }); }
+  if (p === '/api/scan/bulk' && m === 'POST') { if (!need()) return; const b = await readJson(req); try { return json(res, 200, await require('./lib/scanhook').bulk(b.ids, b.action)); } catch (e) { return json(res, 400, { error: e.message }); } }
+  if (p === '/api/scan/fix' && m === 'GET') { if (!need()) return; return json(res, 200, require('./lib/scanhook').fixStatus()); }
+  if (p === '/api/scan/export' && m === 'GET') {
+    if (!need()) return; const sc = require('./lib/scanhook'), want = url.searchParams.get('state') || '';
+    const rows = sc.list().filter(x => want === 'excluded' ? x.skip : (!want || x.state === want || (want === 'issues' && (x.state === 'missing' || x.state === 'differs'))) && (!want || !x.skip));
+    const head = [...sc.CSV_COLS.map(c => c[0]), 'In company sheet'], lbl = { ok: 'Yes', missing: 'MISSING', differs: 'CN differs', nocn: 'Found, no CN in sheet' };
+    const content = writeRows([head, ...rows.map(e => [...sc.CSV_COLS.map(c => String(c[1](e) || '')), (lbl[e.state] || '') + (e.state === 'differs' ? ' (sheet: ' + e.sheetCn + ')' : '')])], 'Scan backup');
+    res.writeHead(200, { 'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', 'Content-Disposition': `attachment; filename="scan-backup-${new Date().toISOString().slice(0, 10)}.xlsx"` }); return res.end(content);
+  }
+  if (p === '/api/sources' && m === 'POST') {
+    if (!need()) return;
+    try { const s = sync.add(await readJson(req)); if (s.url) await sync.syncNow(s.id).catch(() => {}); return json(res, 200, sync.view(s)); }
+    catch (e) { return json(res, 400, { error: e.message }); }
+  }
+  if ((mt = p.match(/^\/api\/sources\/([\w-]+)(?:\/(sync|upload|config|inspect))?$/))) {
+    const s = sync.get(mt[1]); if (!s || !srcGate(me, s)) return json(res, 404, { error: 'That sheet no longer exists' });
+    const act = mt[2];
+    if (!act && m === 'PUT') { if (!need()) return; try { const b = await readJson(req); const hadUrl = s.url; sync.update(s.id, b); if (s.url && (s.url !== hadUrl || b.syncNow)) await sync.syncNow(s.id).catch(() => {}); return json(res, 200, sync.view(s)); } catch (e) { return json(res, 400, { error: e.message }); } }
+    if (!act && m === 'DELETE') { if (!need()) return; sync.remove(s.id); return json(res, 200, { ok: true }); }
+    if (act === 'sync' && m === 'POST') { try { const r = await sync.syncNow(s.id, true); return json(res, 200, { ...r, ...sync.view(s) }); } catch (e) { return json(res, 400, { error: e.message }); } }
+    if (act === 'upload' && m === 'POST') {
+      if (!need()) return; const buf = await readBody(req);
+      if (s.url) return json(res, 400, { error: `"${s.name}" reads its Excel file from a link, so that file is the source. Remove the link first to upload a file by hand.` });
+      try { return json(res, 200, orders.importOrders(buf, url.searchParams.get('mode') === 'merge' ? 'merge' : 'replace', s)); }
+      catch (e) { return json(res, 400, { error: e.message }); }
+    }
+    if (act === 'config' && m === 'GET') return json(res, 200, { cfg: orders.getCfg(s), synced: !!s.url, name: s.name });
+    if (act === 'config' && m === 'PUT') { if (!need()) return; return json(res, 200, orders.setCfg(s, await readJson(req))); }
+    if (act === 'inspect' && m === 'POST') { // read a file's tabs and columns without importing it
+      if (!need()) return;
+      try {
+        let buf = await readBody(req); if (!buf.length) buf = await sync.currentBuffer(s.id);
+        let c; try { c = JSON.parse(url.searchParams.get('cfg') || '{}'); } catch { c = {}; }
+        return json(res, 200, orders.inspect(buf, { ...orders.getCfg(s), ...c }));
+      } catch (e) { return json(res, 400, { error: e.message }); }
+    }
+  }
+
+  // retail shops (accounts from QuickBooks exports + shops registered in WhatsApp)
+  // Retail shops are visible only to the administrator and the people the administrator gave access to (Team page)
+  if (p.startsWith('/api/retail') && !(admin || retail.scopeOf(me).length)) return json(res, 403, { error: 'Retail shops are only available to the administrator and the team members they assign.' });
+  if (p === '/api/retail' && m === 'GET') return json(res, 200, retail.view(me));
+  if (p === '/api/retail/config' && m === 'PUT') { if (!need()) return; try { return json(res, 200, retail.setConfig(await readJson(req))); } catch (e) { return json(res, 400, { error: e.message }); } }
+  if (p === '/api/retail/export' && m === 'GET') {
+    if (!need()) return; const w = ['all', 'approved'].includes(url.searchParams.get('which')) ? url.searchParams.get('which') : 'pending';
+    res.writeHead(200, { 'Content-Type': 'text/csv; charset=utf-8', 'Content-Disposition': `attachment; filename="new-retail-shops-${w}.csv"` }); return res.end('\uFEFF' + retail.exportNew(w));
+  }
+  if ((mt = p.match(/^\/api\/retail\/files\/(accounts|products|invoices)(?:\/(sync|upload|clear))?$/))) {
+    if (!need()) return; const kind = mt[1], act = mt[2];
+    try {
+      if (!act && m === 'PUT') { const before = retail.R().files[kind].url; const f = retail.setFile(kind, await readJson(req)); if (f.url && f.url !== before) await retail.syncFile(kind).catch(() => {}); return json(res, 200, retail.view().files[kind]); }
+      if (act === 'sync' && m === 'POST') { const n = await retail.syncFile(kind); return json(res, 200, { count: n }); }
+      if (act === 'upload' && m === 'POST') return json(res, 200, { count: retail.uploadFile(kind, await readBody(req)) });
+      if (act === 'clear' && m === 'POST') { retail.clearFile(kind); return json(res, 200, { ok: true }); }
+    } catch (e) { return json(res, 400, { error: e.message }); }
+  }
+  if ((mt = p.match(/^\/api\/retail\/accounts\/([^/]+)$/))) {
+    if (!need()) return; const id = decodeURIComponent(mt[1]);
+    try {
+      if (m === 'PATCH') return json(res, 200, retail.updateRegistered(id, await readJson(req)));
+      if (m === 'DELETE') { retail.removeRegistered(id); return json(res, 200, { ok: true }); }
+    } catch (e) { return json(res, 400, { error: e.message }); }
+  }
+
+  // Letterheads of the printed Bill / DC: anyone signed in can read the one for a company (to print), only the administrator edits them
+  if (p.startsWith('/api/letterheads')) {
+    try {
+      if (p === '/api/letterheads/for' && m === 'GET') return json(res, 200, letterhead.forCompany(url.searchParams.get('company') || ''));
+      if (!need()) return;
+      if (p === '/api/letterheads' && m === 'GET') return json(res, 200, { items: letterhead.list() });
+      if (p === '/api/letterheads' && m === 'POST') return json(res, 200, letterhead.save(null, await readJson(req, 4e6)));
+      const mt = p.match(/^\/api\/letterheads\/([\w-]+)$/);
+      if (mt && m === 'PUT') return json(res, 200, letterhead.save(mt[1], await readJson(req, 4e6)));
+      if (mt && m === 'DELETE') { letterhead.remove(mt[1]); return json(res, 200, { ok: true }); }
+    } catch (e) { return json(res, 400, { error: e.message }); }
+  }
+
+  // DC items sync (administrator): the sheets / ERP that hold the items of all DCs, read automatically
+  if (p.startsWith('/api/itemsync')) {
+    if (!need()) return; const fail = (e, c = 400) => json(res, c, { error: e.message });
+    try {
+      if (p === '/api/itemsync' && m === 'GET') return json(res, 200, itemidx.overview());
+      if (p === '/api/itemsync/settings' && m === 'PUT') return json(res, 200, itemidx.setSettings(await readJson(req)));
+      if (p === '/api/itemsync/check' && m === 'POST') return json(res, 200, itemidx.check((await readJson(req)).q));
+      if (p === '/api/itemsync/lookup-all' && m === 'POST') { await readJson(req); return json(res, 200, await itemidx.lookupAll()); }
+      if (p === '/api/itemsync/lookup-stop' && m === 'POST') { await readJson(req); itemidx.stopJob(); return json(res, 200, { ok: true }); }
+      if (p === '/api/itemsync/sources' && m === 'POST') { const s = itemidx.saveSource(null, await readJson(req)); return json(res, 200, { id: s.id }); }
+      if ((mt = p.match(/^\/api\/itemsync\/sources\/([\w-]+)(?:\/(sync|upload))?$/))) {
+        const id = mt[1], act = mt[2];
+        if (act === 'sync' && m === 'POST') { await readJson(req); return json(res, 200, await itemidx.syncSource(id, true)); }
+        if (act === 'upload' && m === 'POST') { let buf; try { buf = await readBody(req, 61e6); } catch { return fail(new Error('The file is larger than 60 MB.'), 413); } return json(res, 200, await itemidx.saveUpload(id, url.searchParams.get('name') || 'items.xlsx', buf)); }
+        if (!act && m === 'PUT') { itemidx.saveSource(id, await readJson(req)); return json(res, 200, { ok: true }); }
+        if (!act && m === 'DELETE') { itemidx.removeSource(id); return json(res, 200, { ok: true }); }
+      }
+    } catch (e) { return fail(e); }
+  }
+  // QuickBooks Online (live customers, products, invoices; new shops are created in QuickBooks)
+  // ---------- WordPress / WooCommerce store ----------
+  // ERP integrations (administrator): pull from an ERP, let it push orders, tell it about status changes
+  if (p.startsWith('/api/integrations/')) {
+    if (!need()) return; const fail = (e, c = 400) => json(res, c, { error: e.message });
+    if (p === '/api/integrations/erp' && m === 'GET') return json(res, 200, { ...erp.overview(), pushUrl: `${(req.headers['x-forwarded-proto'] || 'http').split(',')[0]}://${req.headers['x-forwarded-host'] || req.headers.host}/api/erp/push` });
+    if (p === '/api/integrations/erp' && m === 'POST') { try { return json(res, 200, erp.view(erp.save(null, await readJson(req)))); } catch (e) { return fail(e); } }
+    if ((mt = p.match(/^\/api\/integrations\/erp\/([\w-]+)(?:\/(test|sync))?$/))) {
+      const id = mt[1], act = mt[2];
+      try {
+        if (act === 'test' && m === 'POST') { const b = await readJson(req), base = id === 'new' ? {} : (store.db.erp.connections.find(x => x.id === id) || {}); const conn = { ...base, ...b, map: b.map || base.map || {}, headers: b.headers || base.headers || {} }; for (const k of ['token', 'pass', 'authValue']) if (!b[k]) conn[k] = base[k] || ''; return json(res, 200, await erp.test(conn)); }
+        if (act === 'sync' && m === 'POST') return json(res, 200, { ...(await erp.pull(id)), connection: erp.view(store.db.erp.connections.find(x => x.id === id)) });
+        if (m === 'PUT') return json(res, 200, erp.view(erp.save(id, await readJson(req))));
+        if (m === 'DELETE') { erp.remove(id); return json(res, 200, { ok: true }); }
+      } catch (e) { return fail(e); }
+    }
+    if (p === '/api/integrations/push' && m === 'PUT') { try { return json(res, 200, erp.setPush(await readJson(req))); } catch (e) { return fail(e); } }
+    if (p === '/api/integrations/push/key' && m === 'POST') { try { await readJson(req); const key = erp.newKey(); return json(res, 200, { key, ...erp.overview().push }); } catch (e) { return fail(e); } }
+    if (p === '/api/integrations/hooks' && m === 'POST') { try { return json(res, 200, erp.hookView(erp.saveHook(null, await readJson(req)))); } catch (e) { return fail(e); } }
+    if ((mt = p.match(/^\/api\/integrations\/hooks\/([\w-]+)(?:\/(test))?$/))) {
+      try {
+        if (mt[2] && m === 'POST') { const h = erp.hookById(mt[1]); if (!h) return fail(new Error('Hook not found.'), 404); const ok = await erp.fire(h, erp.sampleOrder(), 'order.test', me.name); return json(res, 200, { ok, ...erp.hookView(h) }); }
+        if (m === 'PUT') return json(res, 200, erp.hookView(erp.saveHook(mt[1], await readJson(req))));
+        if (m === 'DELETE') { erp.removeHook(mt[1]); return json(res, 200, { ok: true }); }
+      } catch (e) { return fail(e); }
+    }
+    return json(res, 404, { error: 'Not found' });
+  }
+  if (p === '/api/woo' && m === 'GET') { if (!need()) return; return json(res, 200, woo.publicStatus()); }
+  if (p === '/api/woo' && m === 'PUT') { if (!need()) return; try { return json(res, 200, woo.setConfig(await readJson(req))); } catch (e) { return json(res, 400, { error: e.message }); } }
+  if (p === '/api/woo/refresh-rate' && m === 'POST') { if (!need()) return; try { await woo.refreshRate(true); return json(res, 200, woo.publicStatus()); } catch (e) { return json(res, 400, { error: e.message }); } }
+  if (p === '/api/woo/test' && m === 'POST') { if (!need()) return; try { await readJson(req); return json(res, 200, await woo.test()); } catch (e) { return json(res, 400, { error: e.message }); } }
+  if (p === '/api/woo/sync' && m === 'POST') { if (!need()) return; try { await readJson(req); return json(res, 200, { ...(await woo.sync()), ...woo.publicStatus() }); } catch (e) { return json(res, 400, { error: e.message }); } }
+  if (p === '/api/woo/logo' && m === 'POST') { if (!need()) return; try { return json(res, 200, woo.setLogo((await readJson(req, 6e6)).dataUrl)); } catch (e) { return json(res, 400, { error: e.message }); } }
+  if (p === '/api/woo/logo' && m === 'DELETE') { if (!need()) return; return json(res, 200, woo.removeLogo()); }
+  if (p === '/api/woo/logo.png' && m === 'GET') { if (!need()) return; const b = woo.logo(); if (!b) { res.writeHead(404); return res.end(); } res.writeHead(200, { 'Content-Type': b[0] === 0xff ? 'image/jpeg' : 'image/png', 'Cache-Control': 'no-cache' }); return res.end(b); }
+  if (p === '/api/woo/sample.pdf' && m === 'GET') { if (!need()) return; const b = woo.pdfFor(woo.sample(url.searchParams.get('paid') === '1')); res.writeHead(200, { 'Content-Type': 'application/pdf', 'Content-Disposition': 'inline; filename="sample-order.pdf"' }); return res.end(b); }
+  if (p === '/api/woo/products' && m === 'GET') return json(res, 200, woo.listProducts(url.searchParams.get('q'), Math.min(1000, +url.searchParams.get('limit') || 60)));
+  if (p === '/api/woo/order.pdf' && m === 'GET') {
+    const d = woo.orders()[String(url.searchParams.get('id') || '')]; if (!d) return json(res, 404, { error: 'Order not found' });
+    if (!admin && !db.orders.filter(orderGate(me)).some(o => o.src === 'woo' && o.orderId === d.number)) return json(res, 403, { error: 'Not allowed' });
+    res.writeHead(200, { 'Content-Type': 'application/pdf', 'Content-Disposition': `inline; filename="Order-${d.number}.pdf"` }); return res.end(woo.pdfFor(d));
+  }
+  if (p === '/api/woo/send-pdf' && m === 'POST') {
+    const b = await readJson(req), d = woo.orders()[String(b.id || '')];
+    if (!d) return json(res, 404, { error: 'Order not found' });
+    if (!admin && !db.orders.filter(orderGate(me)).some(o => o.src === 'woo' && o.orderId === d.number)) return json(res, 403, { error: 'Not allowed' });
+    try { return json(res, 200, await woo.sendPdf(d.number, { agent: me, to: b.to })); } catch (e) { return json(res, 400, { error: e.message }); }
+  }
+  if (p === '/api/woo/send-product' && m === 'POST') {
+    const b = await readJson(req), phone = cleanPhone(b.phone), c = db.conversations[phone];
+    if (!c || !canSeeConv(me, c)) return json(res, 404, { error: 'Chat not found' });
+    try { return json(res, 200, await woo.sendProduct(phone, b.productId, me, b.variationId)); } catch (e) { return json(res, 400, { error: e.message }); }
+  }
+  // order messages to customers (new order PDF, cancelled, completed, tracking…): nothing is sent until the administrator approves it
+  if (p === '/api/woo/outbox' && m === 'GET') { if (!need()) return; return json(res, 200, woo.outboxList()); }
+  if (p === '/api/woo/outbox/approve' && m === 'POST') { if (!need()) return; const b = await readJson(req); try { await woo.approve(b.id, { text: b.text, withPdf: b.withPdf, by: me.name }); return json(res, 200, woo.outboxList()); } catch (e) { return json(res, 400, { error: e.message, ...woo.outboxList() }); } }
+  if (p === '/api/woo/outbox/approve-all' && m === 'POST') {
+    if (!need()) return; const b = await readJson(req); let sent = 0, failed = 0, last = '';
+    for (const x of woo.outboxList().items.filter(x => x.state === 'pending' && (!Array.isArray(b.ids) || b.ids.includes(x.id))).reverse()) { try { await woo.approve(x.id, { by: me.name }); sent++; } catch (e) { failed++; last = e.message; } }
+    return json(res, 200, { sent, failed, error: last, ...woo.outboxList() });
+  }
+  if (p === '/api/woo/outbox/reject' && m === 'POST') { if (!need()) return; const b = await readJson(req); woo.reject(b.ids || b.id, me.name); return json(res, 200, woo.outboxList()); }
+  // the separate "Posting number": Status + Channel posts only (never chats / bot / calls). Administrator only.
+  if (p === '/api/wapost' && m === 'GET') { if (!need()) return; return json(res, 200, wapost.status()); }
+  if (p === '/api/wapost/link' && m === 'POST') { if (!need()) return; try { const b = await readJson(req); await wapost.link({ method: b.method === 'code' ? 'code' : 'qr', phone: b.phone }); return json(res, 200, wapost.status()); } catch (e) { return json(res, 400, { error: e.message }); } }
+  if (p === '/api/wapost/reconnect' && m === 'POST') { if (!need()) return; try { await wapost.reconnect(); return json(res, 200, wapost.status()); } catch (e) { return json(res, 400, { error: e.message }); } }
+  if (p === '/api/wapost/unlink' && m === 'POST') { if (!need()) return; try { await wapost.unlink(); return json(res, 200, wapost.status()); } catch (e) { return json(res, 400, { error: e.message }); } }
+  if (p === '/api/wapost/settings' && m === 'PUT') { if (!need()) return; wapost.updateSettings(await readJson(req)); return json(res, 200, wapost.status()); }
+  // ---------- social posting (TrendSEO Pro on the WordPress shop → every platform) ----------
+  if (p.startsWith('/api/social')) {
+    if (!need()) return; const sub = p.slice('/api/social'.length), E = e => json(res, 400, { error: e.message });
+    if (sub === '' && m === 'GET') return json(res, 200, social.publicStatus());
+    if (sub === '' && m === 'PUT') { try { return json(res, 200, social.setConfig(await readJson(req))); } catch (e) { return E(e); } }
+    if (sub === '/test' && m === 'POST') { try { await readJson(req); const r = await social.test(); return json(res, 200, { ...r, ...social.publicStatus() }); } catch (e) { return E(e); } }
+    if (sub === '/sync' && m === 'POST') { try { await readJson(req); const r = await social.sync(); return json(res, 200, { ...r, ...social.publicStatus() }); } catch (e) { return E(e); } }
+    if (sub === '/img' && m === 'GET') { // a product picture, fetched by the desk (works around hotlink protection / mixed content / empty plugin picture)
+      try { const r = await social.imageFor(url.searchParams.get('id'), url.searchParams.get('u')); res.writeHead(200, { 'Content-Type': r.mime, 'Content-Length': r.buf.length, 'Cache-Control': 'private, max-age=3600' }); return res.end(r.buf); }
+      catch (e) { res.writeHead(404, { 'Content-Type': 'text/plain' }); return res.end(e.message); }
+    }
+    if (sub === '/products' && m === 'GET') return json(res, 200, social.list({ q: url.searchParams.get('q'), limit: Math.min(1000, +url.searchParams.get("limit") || 60), offset: +url.searchParams.get('offset') || 0, filter: url.searchParams.get('filter') || '' }));
+    if (sub === '/viral/run' && m === 'POST') { try { const b = await readJson(req); return json(res, 200, { done: await social.runViral({ n: Math.min(5, Math.max(1, +b.n || 1)), platforms: Array.isArray(b.platforms) ? b.platforms : undefined, source: 'viral manual' }), ...social.publicStatus() }); } catch (e) { return E(e); } }
+    if (sub === '/chats' && m === 'GET') return json(res, 200, { chats: social.chats(url.searchParams.get('q')) });
+    if (sub === '/autopilot' && m === 'GET') { try { return json(res, 200, await social.autopilot()); } catch (e) { return E(e); } }
+    if (sub === '/autopilot/run' && m === 'POST') { try { await readJson(req); return json(res, 200, await social.autopilot({ run: true })); } catch (e) { return E(e); } }
+    if (sub === '/analytics' && m === 'GET') { try { return json(res, 200, await social.analytics(url.searchParams.get('days'), { refresh: url.searchParams.get('refresh') === '1' })); } catch (e) { return E(e); } }
+    if (sub === '/analytics/refresh' && m === 'POST') { try { await readJson(req); const r = await social.analyticsRefresh(); return json(res, 200, { ...r, ...(await social.analytics(url.searchParams.get('days'), { refresh: true })) }); } catch (e) { return E(e); } }
+    if (sub === '/log' && m === 'GET') { try { return json(res, 200, { rows: await social.pluginLog(+url.searchParams.get('product') || 0) }); } catch (e) { return E(e); } }
+    let sm; if ((sm = sub.match(/^\/pack\/(\d+)$/)) && m === 'GET') { try { return json(res, 200, await social.packFor(sm[1])); } catch (e) { return E(e); } }
+    if (sub === '/wa/channel' && m === 'POST') { try { const b = await readJson(req); return json(res, 200, { channel: await social.addChannel(b.link), ...social.publicStatus() }); } catch (e) { return E(e); } }
+    if (sub === '/wa/channel' && m === 'DELETE') { try { social.removeChannel(url.searchParams.get('jid') || ''); return json(res, 200, social.publicStatus()); } catch (e) { return E(e); } }
+    if (sub.startsWith('/yt')) { // Continue with Google (YouTube)
+      const yt = require('./lib/ytconnect');
+      if (sub === '/yt' && m === 'GET') return json(res, 200, yt.status());
+      if (sub === '/yt' && m === 'PUT') { try { return json(res, 200, yt.setConfig(await readJson(req))); } catch (e) { return E(e); } }
+      if (sub === '/yt/login' && m === 'POST') { try { await readJson(req); return json(res, 200, yt.loginUrl()); } catch (e) { return E(e); } }
+      if (sub === '/yt/disconnect' && m === 'POST') { try { await readJson(req); return json(res, 200, await yt.disconnect()); } catch (e) { return E(e); } }
+    }
+    if (sub.startsWith('/fb')) { // Continue with Facebook (Page connection)
+      const fb = require('./lib/fbconnect'); let r;
+      if (sub === '/fb' && m === 'GET') return json(res, 200, fb.status(url.searchParams.get('state') || ''));
+      if (sub === '/fb' && m === 'PUT') { try { return json(res, 200, fb.setConfig(await readJson(req))); } catch (e) { return E(e); } }
+      if (sub === '/fb/login' && m === 'POST') { try { await readJson(req); return json(res, 200, fb.loginUrl()); } catch (e) { return E(e); } }
+      if (sub === '/fb/select' && m === 'POST') { try { const b = await readJson(req); r = await fb.choose(b.state, b.pageId); return json(res, 200, r); } catch (e) { return E(e); } }
+      if (sub === '/fb/disconnect' && m === 'POST') { try { await readJson(req); return json(res, 200, await fb.disconnect()); } catch (e) { return E(e); } }
+    }
+    if (sub.startsWith('/tt')) { // TikTok API settings + sign-in
+      const tt = require('./lib/tiktok');
+      if (sub === '/tt' && m === 'GET') return json(res, 200, tt.status());
+      if (sub === '/tt' && m === 'PUT') { try { return json(res, 200, tt.setConfig(await readJson(req))); } catch (e) { return E(e); } }
+      if (sub === '/tt/login' && m === 'POST') { try { await readJson(req); return json(res, 200, tt.loginUrl()); } catch (e) { return E(e); } }
+      if (sub === '/tt/test' && m === 'POST') { try { await readJson(req); return json(res, 200, { ...(await tt.test()), ...tt.status() }); } catch (e) { return E(e); } }
+      if (sub === '/tt/disconnect' && m === 'POST') { try { await readJson(req); return json(res, 200, await tt.disconnect()); } catch (e) { return E(e); } }
+    }
+    if (sub.startsWith('/sc')) { // Snapchat API settings + sign-in
+      const sc = require('./lib/snapconnect');
+      if (sub === '/sc' && m === 'GET') return json(res, 200, sc.status());
+      if (sub === '/sc' && m === 'PUT') { try { return json(res, 200, sc.setConfig(await readJson(req))); } catch (e) { return E(e); } }
+      if (sub === '/sc/login' && m === 'POST') { try { await readJson(req); return json(res, 200, sc.loginUrl()); } catch (e) { return E(e); } }
+      if (sub === '/sc/test' && m === 'POST') { try { await readJson(req); return json(res, 200, { ...(await sc.test()), ...sc.status() }); } catch (e) { return E(e); } }
+      if (sub === '/sc/disconnect' && m === 'POST') { try { await readJson(req); return json(res, 200, sc.disconnect()); } catch (e) { return E(e); } }
+    }
+    let fm; // Flow AI prompts for one product, or every product as a CSV
+    if ((fm = sub.match(/^\/flow\/(\d+)$/)) && m === 'GET') { try { return json(res, 200, await social.flowFor(fm[1], url.searchParams.get('style') || '')); } catch (e) { return E(e); } }
+    if (sub === '/flow-all.csv' && m === 'GET') {
+      const q = v => '"' + String(v == null ? '' : v).replace(/"/g, '""') + '"', rows = [['Product ID', 'Product', 'Prompt name', 'Aspect', 'Seconds', 'Best for', 'Flow AI prompt', 'Voice-over line', 'Caption'].map(q).join(',')];
+      for (const { p, r } of social.flowAll(url.searchParams.get('style') || '')) for (const x of r.prompts) rows.push([p.id, p.name, x.title, x.aspect, x.seconds, x.where, x.prompt, r.voiceover, r.caption].map(q).join(','));
+      res.writeHead(200, { 'Content-Type': 'text/csv; charset=utf-8', 'Content-Disposition': 'attachment; filename="flow-ai-prompts.csv"', 'Cache-Control': 'no-store' }); return res.end('\ufeff' + rows.join('\r\n'));
+    }
+    if (sub === '/upload' && m === 'POST') { // a picture or video for a post: raw file in the body, goes to the shop's Media Library
+      let buf; try { buf = await readBody(req, 150e6); } catch { return json(res, 413, { error: 'That file is too large (150 MB at most)' }); }
+      if (!buf.length) return json(res, 400, { error: 'The file is empty' });
+      try { return json(res, 200, await social.uploadMedia(buf, req.headers['content-type'], url.searchParams.get('name'))); } catch (e) { return E(e); }
+    }
+    if (sub === '/post' && m === 'POST') { try { const b = await readJson(req); return json(res, 200, { results: await social.post(b.productId, b.items || [], { agentId: me.id, media: b.media }) }); } catch (e) { return E(e); } }
+    if (sub === '/schedule' && m === 'POST') { try { const b = await readJson(req); return json(res, 200, social.schedule(b.productId, b.items || [], +b.runAt, me.id, b.media)); } catch (e) { return E(e); } }
+    if ((sm = sub.match(/^\/queue\/(q_[a-f0-9]+)$/)) && m === 'DELETE') { try { social.unschedule(sm[1]); return json(res, 200, { ok: true }); } catch (e) { return E(e); } }
+    return json(res, 404, { error: 'Not found' });
+  }
+  if (p === '/api/qbo' && m === 'GET') { if (!need()) return; return json(res, 200, qbo.publicStatus()); }
+  if (p === '/api/qbo' && m === 'PUT') { if (!need()) return; try { return json(res, 200, qbo.setConfig(await readJson(req))); } catch (e) { return json(res, 400, { error: e.message }); } }
+  if (p === '/api/qbo/connect' && m === 'POST') { if (!need()) return; try { const b = await readJson(req); return json(res, 200, { url: qbo.connectUrl(b.origin || `http://${req.headers.host}`) }); } catch (e) { return json(res, 400, { error: e.message }); } }
+  if (p === '/api/qbo/sync' && m === 'POST') { if (!need()) return; try { return json(res, 200, { counts: await qbo.sync(), ...qbo.publicStatus() }); } catch (e) { return json(res, 400, { error: e.message }); } }
+  if (p === '/api/qbo/push' && m === 'POST') { if (!need()) return; try { await qbo.pushPending(); return json(res, 200, qbo.publicStatus()); } catch (e) { return json(res, 400, { error: e.message }); } }
+  if (p === '/api/qbo/disconnect' && m === 'POST') { if (!need()) return; return json(res, 200, qbo.disconnect()); }
+
+  // Microsoft sign-in (app / client ID) for OneDrive and SharePoint
+  if (p === '/api/ms' && m === 'GET') { if (!need()) return; return json(res, 200, ms.publicStatus()); }
+  if (p === '/api/ms' && m === 'PUT') { if (!need()) return; try { return json(res, 200, ms.setConfig(await readJson(req))); } catch (e) { return json(res, 400, { error: e.message }); } }
+  if (p === '/api/ms/login' && m === 'POST') { if (!need()) return; try { return json(res, 200, await ms.startLogin()); } catch (e) { return json(res, 400, { error: e.message }); } }
+  if (p === '/api/ms/logout' && m === 'POST') { if (!need()) return; return json(res, 200, ms.signOut()); }
+
+  if (p === '/api/orders/template') {
+    const file = path.join(PUBLIC, 'order-tracking-template.xlsx');
+    if (fs.existsSync(file)) { res.writeHead(200, { 'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', 'Content-Disposition': 'attachment; filename="order-tracking-template.xlsx"' }); return res.end(fs.readFileSync(file)); }
+    const rows = [['Order ID', 'Customer Phone', 'Customer Name', 'Organization', 'Status', 'Courier', 'Tracking Link', 'Last Updated', 'Notes'],
+      ['ORD-2001', '923001234567', 'Example Customer', 'Hilton Hotels', 'Shipped', 'DHL', 'https://example.com/track/2001', new Date().toISOString().slice(0, 10), 'Arrives Friday']];
+    res.writeHead(200, { 'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', 'Content-Disposition': 'attachment; filename="order-tracking-template.xlsx"' });
+    return res.end(writeRows(rows));
+  }
+  if ((mt = p.match(/^\/api\/orders\/([^/]+)$/)) && m === 'PATCH') {
+    const o = db.orders.find(x => orders.normId(x.orderId) === orders.normId(decodeURIComponent(mt[1])) && orderGate(me)(x)); if (!o) return json(res, 404, { error: 'Not found' });
+    const os = sync.get(o.src); if (os && os.url) return json(res, 400, { error: `"${os.name}" is read live from its Excel file. Change the status in that sheet.` });
+    const b = await readJson(req); const was0 = o.status; for (const k of ['status', 'courier', 'link', 'notes']) if (b[k] !== undefined) o[k] = b[k];
+    const was = was0; o.updated = new Date().toISOString().slice(0, 10); store.save(); if (b.status !== undefined && b.status !== was) erp.notify(o, 'order.status', me.name); return json(res, 200, o);
+  }
+
+  // Edit button on a DC (Find PO / Company report): changes the order here and writes it into the company's Excel sheet
+  if (p === '/api/dc/edit' && m === 'POST') {
+    const b = await readJson(req), gate = orderGate(me);
+    const o = db.orders.find(x => x.src === b.src && String(x.row) === String(b.row) && orders.normId(x.orderId) === orders.normId(b.orderId) && gate(x)); if (!o) return json(res, 404, { error: 'That DC was not found. Press Sync now (Order tracking) and open the list again.' });
+    const was = o.status;
+    try {
+      const r = await writeback.edit(o, b.changes || {}, me.name);
+      if (r.statusChanged) erp.notify(o, 'order.status', me.name);
+      return json(res, 200, { ok: true, where: r.where, set: r.set, row: track.describe(o) });
+    } catch (e) { return json(res, 400, { error: e.message }); }
+  }
+
+  // Bulk edit: the same changes for several DCs (only the fields that were filled in)
+  if (p === '/api/dc/bulk' && m === 'POST') {
+    const b = await readJson(req), gate = orderGate(me), items = (Array.isArray(b.items) ? b.items : []).slice(0, 300), results = []; let done = 0;
+    if (!items.length) return json(res, 400, { error: 'Select at least one DC.' });
+    for (const it of items) {
+      const key = `${it.src}|${it.row}|${it.orderId}`, o = db.orders.find(x => x.src === it.src && String(x.row) === String(it.row) && orders.normId(x.orderId) === orders.normId(it.orderId) && gate(x));
+      if (!o) { results.push({ key, ok: false, label: String(it.orderId || ''), error: 'Not found. Press Sync now and try again.' }); continue; }
+      const label = o.po || o.orderId;
+      try { const r = await writeback.edit(o, b.changes || {}, me.name); if (r.statusChanged) erp.notify(o, 'order.status', me.name); done++; results.push({ key, ok: true, row: track.describe(o) }); }
+      catch (e) { if (e.message === 'Nothing was changed.') { done++; results.push({ key, ok: true, row: track.describe(o) }); } else results.push({ key, ok: false, label, error: e.message }); }
+    }
+    return json(res, 200, { done, failed: results.length - done, results });
+  }
+
+  // Bulk "Edit columns": any column of the sheet (also empty ones), a value per DC; written into each company's Excel sheet
+  if (p === '/api/dc/cells' && m === 'POST') {
+    const b = await readJson(req, 4e6), gate = orderGate(me), items = (Array.isArray(b.items) ? b.items : []).slice(0, 300), results = []; let done = 0;
+    if (!items.length) return json(res, 400, { error: 'Select at least one DC.' });
+    for (const it of items) {
+      const key = `${it.src}|${it.row}|${it.orderId}`, o = db.orders.find(x => x.src === it.src && String(x.row) === String(it.row) && orders.normId(x.orderId) === orders.normId(it.orderId) && gate(x));
+      if (!o) { results.push({ key, ok: false, label: String(it.orderId || ''), error: 'Not found. Press Sync now and try again.' }); continue; }
+      const label = o.dc || o.po || o.orderId;
+      try { const r = await writeback.editCells(o, it.cells && typeof it.cells === 'object' ? it.cells : {}, me.name); if (r.statusChanged) erp.notify(o, 'order.status', me.name); done++; results.push({ key, ok: true, row: track.describe(o) }); }
+      catch (e) { if (e.message === 'Nothing was changed.') { done++; results.push({ key, ok: true, row: track.describe(o) }); } else results.push({ key, ok: false, label, error: e.message }); }
+    }
+    return json(res, 200, { done, failed: results.length - done, results });
+  }
+
+  // Bulk print of the selected DCs: one row per item (DENO, NAME OF ITEMS, UNIT, PRICE ... CONTACT) as Excel, PDF or rows for the Print window
+  if (p === '/api/dc/items-export' && m === 'POST') {
+    const b = await readJson(req, 4e6), gate = orderGate(me), itemWords = String(b.item || '').trim().slice(0, 120), items = (Array.isArray(b.items) ? b.items : []).slice(0, itemWords ? 1500 : 400), list = [];
+    if (!items.length) return json(res, 400, { error: 'Select at least one DC.' });
+    for (const it of items) { const o = db.orders.find(x => x.src === it.src && String(x.row) === String(it.row) && orders.normId(x.orderId) === orders.normId(it.orderId) && gate(x)); if (o && !list.includes(o)) list.push(o); }
+    if (!list.length) return json(res, 404, { error: 'Those DCs were not found. Press Sync now and open the list again.' });
+    const data = await dcexport.build(list, { item: itemWords }), fmt = ['pdf', 'xlsx', 'json'].includes(b.format) ? b.format : 'xlsx';
+    if (fmt === 'json') return json(res, 200, { ...data, business: db.settings.businessName || '' });
+    if (itemWords && !data.rows.length) return json(res, 404, { error: `No DC has an item matching "${itemWords}".` });
+    const day = new Date().toISOString().slice(0, 10), biz = db.settings.businessName || 'WhatsApp Desk', slug = itemWords ? '-' + itemWords.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 30) : '', name = `dc-items${slug}-${day}.${fmt}`;
+    const content = fmt === 'pdf' ? dcexport.toPdf(data, { title: itemWords ? `DC items - ${itemWords}` : 'DC items', subtitle: `${biz} - ${day} - ${data.dcs} DC${data.dcs === 1 ? '' : 's'}${itemWords ? ' - only items matching "' + itemWords + '"' : ''}`, footer: `${biz} - generated from WhatsApp Desk` }) : dcexport.toXlsx(data);
+    res.writeHead(200, { 'Content-Type': fmt === 'pdf' ? 'application/pdf' : 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', 'Content-Disposition': `attachment; filename="${name}"`, 'X-DC-Missing': String(data.missing.length), 'X-DC-Missing-List': encodeURIComponent(data.missing.slice(0, 20).join(', ')), 'Access-Control-Expose-Headers': 'X-DC-Missing, X-DC-Missing-List, Content-Disposition' });
+    return res.end(content);
+  }
+
+  // shared email inbox (several Gmail mailboxes)
+  if (p === '/api/mailbox/accounts' && m === 'GET') { if (!need()) return; return json(res, 200, { accounts: inbox.accounts() }); }
+  if (p === '/api/mailbox/accounts' && m === 'POST') { if (!need()) return; try { return json(res, 200, inbox.publicAcc(inbox.saveAccount(null, await readJson(req)))); } catch (e) { return json(res, 400, { error: e.message }); } }
+  if ((mt = p.match(/^\/api\/mailbox\/accounts\/(\w+)(?:\/(sync))?$/))) {
+    if (!need()) return;
+    if (mt[2] && m === 'POST') { try { return json(res, 200, await inbox.sync(mt[1])); } catch (e) { return json(res, 400, { error: e.message }); } }
+    if (m === 'PUT') { try { return json(res, 200, inbox.publicAcc(inbox.saveAccount(mt[1], await readJson(req)))); } catch (e) { return json(res, 400, { error: e.message }); } }
+    if (m === 'DELETE') { inbox.removeAccount(mt[1]); return json(res, 200, { ok: true }); }
+  }
+  const lst = v => (Array.isArray(v) ? v : String(v || '').split(/[\s,;]+/)).map(x => x.trim().toLowerCase()).filter(Boolean);
+  if (p === '/api/mailbox/drafts' && m === 'GET') return json(res, 200, { drafts: inbox.drafts(me) });
+  if (p === '/api/mailbox/drafts' && m === 'POST') { const b = await readJson(req); return json(res, 200, inbox.saveDraft(me, { ...b, to: lst(b.to), cc: lst(b.cc), bcc: lst(b.bcc) })); }
+  if ((mt = p.match(/^\/api\/mailbox\/drafts\/(\w+)$/)) && m === 'DELETE') { inbox.removeDraft(me, mt[1]); return json(res, 200, { ok: true }); }
+  if (p === '/api/mailbox/scheduled' && m === 'GET') return json(res, 200, { scheduled: inbox.scheduled(me) });
+  if (p === '/api/mailbox/scheduled' && m === 'POST') { const b = await readJson(req, 40e6); try { const r = inbox.schedule(me, { ...b, to: lst(b.to), cc: lst(b.cc), bcc: lst(b.bcc) }); return json(res, 200, { id: r.id }); } catch (e) { return json(res, 400, { error: e.message }); } }
+  if ((mt = p.match(/^\/api\/mailbox\/scheduled\/(\w+)$/)) && m === 'DELETE') { inbox.cancelScheduled(me, mt[1]); return json(res, 200, { ok: true }); }
+  if (p === '/api/mailbox/internal' && m === 'GET') { if (!need()) return; return json(res, 200, { internal: inbox.internal() }); }
+  if (p === '/api/mailbox/internal' && m === 'PUT') { if (!need()) return; const b = await readJson(req); return json(res, 200, { internal: inbox.setInternal(b.internal) }); }
+  if (p === '/api/mailbox/rules' && m === 'GET') { if (!need()) return; return json(res, 200, { rules: inbox.rules() }); }
+  if (p === '/api/mailbox/rules' && m === 'POST') { if (!need()) return; try { return json(res, 200, inbox.saveRule(null, await readJson(req))); } catch (e) { return json(res, 400, { error: e.message }); } }
+  if (p === '/api/mailbox/rules/apply' && m === 'POST') { if (!need()) return; return json(res, 200, { moved: inbox.applyRules() }); }
+  if ((mt = p.match(/^\/api\/mailbox\/rules\/(\w+)$/))) {
+    if (!need()) return;
+    if (m === 'PUT') { try { return json(res, 200, inbox.saveRule(mt[1], await readJson(req))); } catch (e) { return json(res, 400, { error: e.message }); } }
+    if (m === 'DELETE') { inbox.removeRule(mt[1]); return json(res, 200, { ok: true }); }
+  }
+  // team filters, label permissions and labels (Gmail-style)
+  if (p === '/api/mailbox/perms' && m === 'GET') return json(res, 200, { perms: inbox.perms() });
+  if (p === '/api/mailbox/perms' && m === 'PUT') { if (!need()) return; return json(res, 200, { perms: inbox.setPerms(await readJson(req)) }); }
+  if (p === '/api/mailbox/filters' && m === 'GET') return json(res, 200, { filters: inbox.listFilters(me), perms: inbox.perms() });
+  if (p === '/api/mailbox/filters/preview' && m === 'POST') { try { const b = await readJson(req); return json(res, 200, { count: inbox.countMatches(me, b.criteria, b.accountId) }); } catch (e) { return json(res, 400, { error: e.message }); } }
+  if (p === '/api/mailbox/filters' && m === 'POST') { try { const b = await readJson(req); const f = inbox.saveFilter(me, null, b); const r = b.applyExisting ? await inbox.applyFilterNow(f) : { n: 0 }; return json(res, 200, { filter: f, applied: r.n, warn: r.warn || '' }); } catch (e) { return json(res, 400, { error: e.message }); } }
+  if ((mt = p.match(/^\/api\/mailbox\/filters\/(\w+)$/))) {
+    try { if (m === 'PUT') return json(res, 200, { filter: inbox.saveFilter(me, mt[1], await readJson(req)) }); if (m === 'DELETE') { inbox.removeFilter(me, mt[1]); return json(res, 200, { ok: true }); } } catch (e) { return json(res, 400, { error: e.message }); }
+  }
+  if (p === '/api/mailbox/labels' && m === 'POST') { try { const b = await readJson(req); return json(res, 200, await inbox.createLabel(me, b.name, b.accountId)); } catch (e) { return json(res, 400, { error: e.message }); } }
+  if (p === '/api/mailbox/labels' && m === 'DELETE') { try { const b = await readJson(req); return json(res, 200, { ok: true, ...(await inbox.deleteLabel(me, b.name)) }); } catch (e) { return json(res, 400, { error: e.message }); } }
+  if (p === '/api/mailbox/sync' && m === 'POST') { if (!need()) return; try { return json(res, 200, await inbox.sync()); } catch (e) { return json(res, 400, { error: e.message }); } }
+  if (p === '/api/mailbox/search' && m === 'GET') { try { return json(res, 200, await inbox.remoteSearch(me, url.searchParams.get('q') || '', url.searchParams.get('acc') || '', url.searchParams.get('mode') || 'gmail')); } catch (e) { return json(res, 200, { ids: null, error: e.message }); } }
+  if (p === '/api/mailbox' && m === 'GET') return json(res, 200, { threads: inbox.list(me, url.searchParams.get('all') === '1'), accounts: inbox.accounts().map(a => ({ id: a.id, label: a.label, user: a.user, backLeft: a.backLeft, backTotal: a.backTotal, backDone: a.backDone, loadAll: a.loadAll })), labels: inbox.labelsFor(me), perms: inbox.perms(), defaultAccount: me.mailDefault || '' });
+  if (p === '/api/mailbox/archive' && m === 'GET') { try { return json(res, 200, inbox.archSearch(me, url.searchParams.get('q') || '')); } catch (e) { return json(res, 400, { error: e.message }); } }
+  if ((mt = p.match(/^\/api\/mailbox\/archive\/(\w+)\/restore$/)) && m === 'POST') { try { return json(res, 200, { ok: true, thread: inbox.restore(mt[1], me) }); } catch (e) { return json(res, 400, { error: e.message }); } }
+  if (p === '/api/mailbox/new' && m === 'POST') {
+    const b = await readJson(req, 40e6); const list = v => (Array.isArray(v) ? v : String(v || '').split(/[\s,;]+/)).map(x => x.trim().toLowerCase()).filter(Boolean);
+    try { return json(res, 200, await inbox.send(null, me, { background: true, accountId: b.accountId, to: list(b.to), cc: list(b.cc), bcc: list(b.bcc), subject: String(b.subject || '(no subject)'), text: b.text, html: b.html, attachments: b.attachments })); } catch (e) { return json(res, 400, { error: e.message }); }
+  }
+  if ((mt = p.match(/^\/api\/mailbox\/file\/(\w+)\/(\d+)$/))) {
+    let f = inbox.file(mt[1], mt[2], me); if (f && !inbox.fileOk(f)) f = await inbox.recoverFile(mt[1], mt[2], me).catch(() => null); // missing or EMPTY (0 KB) on disk: fetch it again from the mailbox
+    if (f && !inbox.fileOk(f) && url.searchParams.get('as') !== 'table') return json(res, 422, { error: 'The stored copy of this attachment is damaged and could not be re-downloaded from the mailbox. Open the mail in Gmail and download it there, or check that the mail account is connected.' });
+    if (!f || !fs.existsSync(f.path)) return json(res, 404, { error: 'This attachment could not be found in the app or re-downloaded from the mailbox. Open the mail in Gmail once, or check that the mail account is connected.' });
+    const ext = (String(f.name).match(/\.([A-Za-z0-9]+)$/) || [])[1]?.toLowerCase() || '';
+    if (url.searchParams.get('as') === 'table') { // spreadsheet preview
+      if (ext === 'csv' || ext === 'tsv') { try { return json(res, 200, require('./lib/xlsx').readCsv(fs.readFileSync(f.path, 'utf8'), ext === 'tsv')); } catch (e) { return json(res, 400, { error: 'Could not read this file' }); } } // CSV opens as a worksheet too
+      if (ext !== 'xlsx' && ext !== 'xlsm') return json(res, 400, { error: 'No table preview for this file' });
+      try { const buf = fs.readFileSync(f.path), xl = require('./lib/xlsx'); const sh = url.searchParams.get('sheet') || undefined, out = { sheets: xl.sheetNames(buf), rows: xl.readRows(buf, sh).slice(0, 500).map(r => r.slice(0, 40)) }; try { out.look = xl.readGrid(buf, sh); } catch (e) { /* styles unreadable: the plain table still shows */ } return json(res, 200, out); }
+      catch (e) { return json(res, 400, { error: 'Could not read this spreadsheet' }); }
+    }
+    const SAFE = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp', bmp: 'image/bmp', svg: 'image/svg+xml', pdf: 'application/pdf', txt: 'text/plain; charset=utf-8', log: 'text/plain; charset=utf-8', csv: 'text/plain; charset=utf-8', json: 'text/plain; charset=utf-8', md: 'text/plain; charset=utf-8', mp4: 'video/mp4', webm: 'video/webm', mp3: 'audio/mpeg', wav: 'audio/wav', ogg: 'audio/ogg', m4a: 'audio/mp4' };
+    if (url.searchParams.get('inline') === '1' && SAFE[ext]) { // shown in the preview window — never as a page that could run scripts
+      res.writeHead(200, { 'Content-Type': SAFE[ext], 'Content-Disposition': `inline; filename*=UTF-8''${encodeURIComponent(f.name)}`, 'X-Content-Type-Options': 'nosniff', 'Cache-Control': 'private, max-age=300', ...(ext === 'pdf' ? {} : { 'Content-Security-Policy': "sandbox; default-src 'none'; style-src 'unsafe-inline'; img-src data:; media-src 'self'" }) });
+      return fs.createReadStream(f.path).pipe(res);
+    }
+    res.writeHead(200, { 'Content-Type': ext === 'pdf' ? 'application/pdf' : 'application/octet-stream', 'Content-Disposition': `attachment; filename="${String(f.name).replace(/[^\x20-\x7e]|["\\]/g, '_')}"; filename*=UTF-8''${encodeURIComponent(f.name)}`, 'X-Content-Type-Options': 'nosniff', 'Content-Length': fs.statSync(f.path).size }); return fs.createReadStream(f.path).pipe(res);
+  }
+  if ((mt = p.match(/^\/api\/mailbox\/(\w+)(?:\/(reply|read|unread|star|resolve|reopen|assign|label|important|trash|delmsg|restore|spam|purge))?$/))) {
+    const t = inbox.get(mt[1], me); if (!t && !mt[2] && m === 'GET') { const ar = inbox.archived(mt[1], me); if (ar) return json(res, 200, ar); }
+    if (!t) return json(res, 404, { error: 'Email not found (or it belongs to someone else)' });
+    if (!mt[2] && m === 'GET') { try { await inbox.recoverHtml(t); } catch {} return json(res, 200, { thread: { ...t }, mails: inbox.messages(t) }); }
+    if (m === 'POST') {
+      const b = await readJson(req, 40e6);
+      try {
+        if (mt[2] === 'reply') return json(res, 200, await inbox.send(t, me, { background: true, text: b.text, html: b.html, replyAll: !!b.replyAll, forward: !!b.forward, copyHandler: b.copyHandler !== false, to: b.to ? String(b.to).split(/[\s,;]+/).map(x => x.trim().toLowerCase()).filter(Boolean) : undefined, cc: b.cc ? String(b.cc).split(/[\s,;]+/).map(x => x.trim().toLowerCase()).filter(Boolean) : undefined, bcc: b.bcc ? String(b.bcc).split(/[\s,;]+/).map(x => x.trim().toLowerCase()).filter(Boolean) : undefined, attachments: b.attachments }));
+        if (mt[2] === 'assign' && !admin && t.agentId !== me.id) return json(res, 403, { error: 'Only the owner can hand this over' });
+        return json(res, 200, { ok: true, ...(await inbox.act(t, me, mt[2], b)) });
+      } catch (e) { return json(res, 400, { error: e.message }); }
+    }
+  }
+
+  // PO follow-up: dispatched DCs without a PO. Everybody signed in works the list (add a PO, DC / quotation files, Excel / PDF);
+  // only the ADMIN sees or changes the ERP link, the reminder mails and which companies show here.
+  if (p.startsWith('/api/pofollow')) {
+    // a team member only works the DCs of the companies (organizations) assigned to them, the same rule as Order tracking; the admin sees all
+    const mine = (() => { if (admin) return () => true; const memo = new Map(), alk = dcalerts.orgSet(me.id), gmm = new Map(); return x => { const k = (x.org || '') + '|' + (x.company || ''); if (!memo.has(k)) { const g = track.orgFor(x.org) || track.orgFor(x.company); memo.set(k, !!(g && (g.agentId === me.id || g.backupAgentId === me.id)) || alk.has('*') || alk.has(groupOf({ organization: x.org, company: x.company }, gmm).key)); } return memo.get(k); }; })();
+    const orderMine = o => !!o && mine({ org: o.organization, company: o.company });
+    const keyOk = key => admin || orderMine(dcdocs.findOrder(String(key || '')));
+    const dcOk = (src, dc) => admin || orderMine(db.orders.find(o => o.src === src && orders.normId(o.dc) === orders.normId(dc)));
+    const keyOfDoc = id => { for (const [k, a] of Object.entries(db.dcDocs || {})) if (a.some(x => x.id === id)) return k; return ''; };
+    const notYours = { error: 'This DC is not in a company assigned to you.' };
+    const ruleFor = x => pofollow.rules().find(q => q.enabled && (!q.companies.length || q.companies.some(c => c.toLowerCase() === x.company.toLowerCase())));
+    const ruleView = r => ({ ...r, pending: pofollow.pending(r.companies).filter(x => x.days >= (r.minDays || 0)).length });
+    if (p === '/api/pofollow' && m === 'GET') {
+      const list = pofollow.pending().filter(mine), e = reports.effectiveCfg(), recd = pofollow.visibleAdded().filter(mine);
+      const out = { pending: list.map(x => ({ ...x, docs: dcdocs.count(x.key), canMail: !!ruleFor(x) })), received: recd.slice(0, 100), dcSheets: pofollow.visibleSheets().filter(n => mine({ company: n, org: n })),
+        summary: { count: list.length, oldest: Math.max(0, ...list.map(x => x.days)), receivedToday: recd.filter(x => new Date(x.at).toDateString() === new Date().toDateString()).length } };
+      // the ERP link (it can hold a sign-in key), the reminder mails, the mail account and the company switches are for the admin only
+      if (admin) Object.assign(out, { admin: true, erpDocs: dcdocs.settings(), rules: pofollow.rules().map(ruleView), companies: reports.companies(), allCompanies: pofollow.allCompanies(), hiddenCompanies: pofollow.hidden(), closed: pofollow.visibleDone().slice(0, 300), mailReady: !!e, via: e ? e.from || e.user || '' : '' });
+      else Object.assign(out, { admin: false, erpDocs: {}, rules: [], companies: [], allCompanies: [], hiddenCompanies: [], closed: [], mailReady: true, via: '' });
+      return json(res, 200, out);
+    }
+    // admin: mark DCs done (closed, no PO needed), one or many; reopen them again
+    if ((p === '/api/pofollow/done' || p === '/api/pofollow/reopen') && m === 'POST') { if (!need()) return; const b = await readJson(req), keys = Array.isArray(b.keys) ? b.keys : []; return json(res, 200, p.endsWith('done') ? { done: pofollow.markDone(keys, me.name) } : { reopened: pofollow.reopen(keys) }); }
+    if (p === '/api/pofollow/companies' && m === 'PUT') { if (!need()) return; const b = await readJson(req); return json(res, 200, { hidden: pofollow.setHidden(b.hidden), allCompanies: pofollow.allCompanies() }); }
+    // DC + quotation files of each DC: upload by hand, or fetch from the sheet / ERP; they go with the mail of that DC
+    if (p === '/api/pofollow/docs' && m === 'GET' && !keyOk(url.searchParams.get('key'))) return json(res, 403, notYours);
+    if (p === '/api/pofollow/docs' && m === 'GET') return json(res, 200, { docs: dcdocs.list(url.searchParams.get('key') || '') });
+    if (p === '/api/pofollow/docs' && m === 'POST') { // raw file in the body: ?key=<dc key>&kind=dc|quote&name=<file name>
+      if (!keyOk(url.searchParams.get('key'))) return json(res, 403, notYours);
+      let buf; try { buf = await readBody(req, 16e6); } catch { return json(res, 413, { error: 'The file is larger than 15 MB.' }); }
+      try { const d = dcdocs.add(url.searchParams.get('key') || '', url.searchParams.get('kind') || '', url.searchParams.get('name') || 'file', buf, me.name); pofollow.bust(); return json(res, 200, { doc: d, docs: dcdocs.list(url.searchParams.get('key')) }); } catch (e) { return json(res, 400, { error: e.message }); }
+    }
+    if (p === '/api/pofollow/docs/link' && m === 'POST') { // add the DC file from a OneDrive / SharePoint / web link; an Excel / CSV file also returns its items
+      const b = await readJson(req), k = String(b.key || ''); if (!keyOk(k)) return json(res, 403, notYours);
+      try {
+        const f = await dcdocs.fetchLinkFile(b.url), o = dcdocs.findOrder(k); if (!o) throw new Error('That DC was not found. Press Sync now and try again.');
+        const d = dcdocs.add(k, 'dc', `DC-${String(o.dc).replace(/[^\w.\- ()]+/g, '_')}.${f.ext}`, f.buf, me.name, 'link'); pofollow.bust();
+        const items = ['xlsx', 'csv'].includes(f.ext) ? dcitems.clean(dcitems.parseFile(f.buf, 'x.' + f.ext).map(i => ({ ...i, status: 'pending' }))) : [];
+        return json(res, 200, { doc: d, docs: dcdocs.list(k), items });
+      } catch (e) { return json(res, 400, { error: e.message }); }
+    }
+    if (p === '/api/pofollow/docs/fetch' && m === 'POST') { // get them from the sheet link columns / the ERP address
+      const b = await readJson(req), keys = (Array.isArray(b.keys) ? b.keys : [b.key]).filter(Boolean).filter(keyOk).slice(0, 400); let dc = 0, quote = 0, none = 0;
+      const queue = keys.slice(); await Promise.all(Array.from({ length: Math.min(6, queue.length) }, async () => { for (let k; (k = queue.shift());) { try { const g = await dcdocs.autoFetch(k, me.name); dc += g.dc; quote += g.quote; if (!g.dc && !g.quote) none++; } catch { none++; } } }));
+      pofollow.bust(); return json(res, 200, { dc, quote, none, docs: keys.length === 1 ? dcdocs.list(keys[0]) : undefined });
+    }
+    if (p === '/api/pofollow/docs/settings' && m === 'PUT') { if (!need()) return; try { return json(res, 200, dcdocs.setSettings(await readJson(req))); } catch (e) { return json(res, 400, { error: e.message }); } }
+    if ((mt = p.match(/^\/api\/pofollow\/docs\/([\w-]+)$/))) {
+      if (!admin) { const k = keyOfDoc(mt[1]); if (!k || !keyOk(k)) return json(res, 404, { error: 'File not found.' }); }
+      if (m === 'GET') { try { const d = dcdocs.read(mt[1]); res.writeHead(200, { 'Content-Type': d.type, 'Content-Disposition': `inline; filename="${d.name.replace(/"/g, '')}"` }); return res.end(d.buf); } catch (e) { return json(res, 404, { error: e.message }); } }
+      if (m === 'DELETE') { try { dcdocs.remove(mt[1]); pofollow.bust(); return json(res, 200, { ok: true }); } catch (e) { return json(res, 404, { error: e.message }); } }
+    }
+    // Items of a DC (Company report -> open a DC): the DC file + the items in it, tracked one by one
+    if (p === '/api/pofollow/items' && m === 'GET') { const k = url.searchParams.get('key') || ''; if (!keyOk(k)) return json(res, 403, notYours); const o = dcdocs.findOrder(k); let items = []; if (o) { try { items = await dcfiles.itemsForOrderAsync(o); } catch { items = dcfiles.itemsForOrder(o); } } return json(res, 200, { items, summary: dcitems.summary(items), auto: items.some(i => i.auto), via: (items[0] && items[0].viaLabel) || '', source: (items[0] && items[0].src) || '', tab: (items[0] && items[0].tab) || '' }); }
+    if (p === '/api/pofollow/doc' && m === 'GET') { // Print bill / Print DC: the items + invoice no, date, address, contact of the bill sheet (doc=bill) or the DC sheet (doc=dc)
+      const k = url.searchParams.get('key') || ''; if (!keyOk(k)) return json(res, 403, notYours); const o = dcdocs.findOrder(k), doc = url.searchParams.get('doc') === 'dc' ? 'dc' : 'bill'; let r = { items: [], head: {}, found: false };
+      if (o) { try { await itemidx.ensureLookup(o); } catch { /* the sheets are used as they are */ } r = itemidx.docFor(o, doc); if (!r.items.length) { let items = []; try { items = await dcfiles.itemsForOrderAsync(o); } catch { items = dcfiles.itemsForOrder(o); } r = { items, head: {}, found: false, fallback: true }; } }
+      return json(res, 200, r); }
+    if (p === '/api/pofollow/items' && m === 'PUT') { const b = await readJson(req), k = String(b.key || ''); if (!keyOk(k)) return json(res, 403, notYours); try { const it = dcfiles.setItemStatus(String(b.recId || ''), String(b.itemId || ''), { status: b.status, got: b.got, note: b.note }); return json(res, 200, { item: it }); } catch (e) { return json(res, 400, { error: e.message }); } }
+    // Edit one item of a DC (qty, name, unit, price, tax ...): written into the original Excel sheet, for the administrator and for team members of that company
+    if (p === '/api/pofollow/items/edit' && m === 'PUT') {
+      const b = await readJson(req), k = String(b.key || ''); if (!keyOk(k)) return json(res, 403, notYours);
+      const o = dcdocs.findOrder(k); if (!o) return json(res, 404, { error: 'That DC was not found.' });
+      let list = []; try { list = await dcfiles.itemsForOrderAsync(o); } catch { list = dcfiles.itemsForOrder(o); }
+      const cur = list.find(i => i.id === String(b.itemId || '') && String(i.recId || '') === String(b.recId || '')); if (!cur) return json(res, 404, { error: 'That item is not in this DC any more. Close and open the DC again.' });
+      const ch = b.changes && typeof b.changes === 'object' ? b.changes : {};
+      try {
+        if (b.recId === 'auto') return json(res, 200, await itemidx.editItem(cur.id, ch, me.name, Array.isArray(b.manual) ? b.manual : []));
+        const it = dcfiles.editItem(String(b.recId), cur.id, ch); return json(res, 200, { item: { ...it, recId: b.recId, edit: { ok: true, fields: ['desc', 'qty', 'unit'], app: true } }, where: 'app', written: 0 });
+      } catch (e) { return json(res, 400, { error: e.message }); }
+    }
+    if (p === '/api/pofollow/items/parse' && m === 'POST') { // Excel / CSV file as the raw body (?name=), or { text } pasted from a sheet -> the items found in it
+      let items = [];
+      if ((req.headers['content-type'] || '').includes('json')) items = dcitems.parseText((await readJson(req)).text);
+      else { let buf; try { buf = await readBody(req, 16e6); } catch { return json(res, 413, { error: 'The file is larger than 15 MB.' }); } items = dcitems.parseFile(buf, url.searchParams.get('name') || ''); }
+      return json(res, 200, { items: dcitems.clean(items.map(i => ({ ...i, status: 'pending' }))) });
+    }
+    if (p === '/api/pofollow/send-dc' && m === 'POST') { // mail ONE DC now (with its DC + quotation attached)
+      const b = await readJson(req), x = pofollow.pending().filter(mine).find(q => q.key === b.key); if (!x) return json(res, 404, { error: 'That DC already has a PO, or was not found.' });
+      const em = v => (Array.isArray(v) ? v : String(v || '').split(/[\n,;]+/)).map(s => s.trim().toLowerCase()).filter(Boolean);
+      const rule = ruleFor(x), to = admin ? em(b.to) : [], cc = admin ? em(b.cc) : [];
+      if (!admin && !rule) return json(res, 400, { error: 'No reminder is set up for this company yet. Ask the admin to add the PO maker\'s email first.' });
+      if (to.some(e => !/^[^\s@,;<>]+@[^\s@,;<>]+\.[^\s@,;<>]+$/.test(e)) || cc.some(e => !/^[^\s@,;<>]+@[^\s@,;<>]+\.[^\s@,;<>]+$/.test(e))) return json(res, 400, { error: 'One of the email addresses is not valid.' });
+      try { const r = await pofollow.sendDc(x, { r: rule, to: to.length ? to : undefined, cc: to.length ? cc : undefined, note: String(b.note || '').trim().slice(0, 2000) || undefined }); return json(res, 200, r); } catch (e) { return json(res, 400, { error: e.message }); }
+    }
+    if (p === '/api/pofollow/po' && m === 'POST') { try { const b = await readJson(req); if (!dcOk(b.src, b.dc)) return json(res, 403, notYours); return json(res, 200, await pofollow.addPo(b, me.name)); } catch (e) { return json(res, 400, { error: e.message }); } }
+    if (p === '/api/pofollow/po/bulk' && m === 'POST') {
+      const b = await readJson(req), items = (Array.isArray(b.items) ? b.items : []).slice(0, 300), results = [];
+      for (const it of items) { try { if (!dcOk(it.src, it.dc)) throw new Error(notYours.error); const r = await pofollow.addPo(it, me.name); results.push({ dc: it.dc, ok: true, why: r.why, duplicate: r.duplicate }); } catch (e) { results.push({ dc: it.dc, ok: false, error: e.message }); } }
+      return json(res, 200, { done: results.filter(x => x.ok).length, failed: results.filter(x => !x.ok).length, results });
+    }
+    if ((mt = p.match(/^\/api\/pofollow\/po\/([\w-]+)$/)) && m === 'DELETE') { try { const rec0 = pofollow.added().find(x => x.id === mt[1]); if (rec0 && !mine({ company: rec0.company })) return json(res, 403, notYours); pofollow.removePo(mt[1]); return json(res, 200, { ok: true }); } catch (e) { return json(res, 404, { error: e.message }); } }
+    if (p === '/api/pofollow/download' && m === 'GET') {
+      const f = pofollow.files(pofollow.pending(url.searchParams.get('company') ? [url.searchParams.get('company')] : []).filter(mine), null).find(x => x.filename.endsWith('.' + (url.searchParams.get('format') === 'pdf' ? 'pdf' : 'xlsx')));
+      res.writeHead(200, { 'Content-Type': f.type, 'Content-Disposition': `attachment; filename="${f.filename}"` }); return res.end(f.content);
+    }
+    if (p === '/api/pofollow/rules' && m === 'POST') { if (!need()) return; try { const r = pofollow.clean(await readJson(req)); pofollow.rules().push(r); store.save(); return json(res, 200, ruleView(r)); } catch (e) { return json(res, 400, { error: e.message }); } }
+    if ((mt = p.match(/^\/api\/pofollow\/rules\/([\w-]+)(?:\/(run))?$/))) {
+      if (!need()) return;
+      const r = pofollow.rules().find(x => x.id === mt[1]); if (!r) return json(res, 404, { error: 'Reminder not found' });
+      if (!mt[2] && m === 'PUT') { try { Object.assign(r, pofollow.clean(await readJson(req), r)); store.save(); return json(res, 200, ruleView(r)); } catch (e) { return json(res, 400, { error: e.message }); } }
+      if (!mt[2] && m === 'PATCH') { const b = await readJson(req); if (b.enabled !== undefined) r.enabled = !!b.enabled; store.save(); return json(res, 200, ruleView(r)); }
+      if (!mt[2] && m === 'DELETE') { db.poRules = pofollow.rules().filter(x => x !== r); store.save(); return json(res, 200, { ok: true }); }
+      if (mt[2] === 'run' && m === 'POST') { try { return json(res, 200, await pofollow.run(r, { manual: true })); } catch (e) { return json(res, 400, { error: e.message }); } }
+    }
+    return json(res, 404, { error: 'Not found' });
+  }
+
+  // email account + scheduled reports (admin)
+  if (p === '/api/mail' && m === 'GET') { if (!need()) return; const c = reports.mailCfg(), e = reports.effectiveCfg(); return json(res, 200, { ...c, pass: '', hasPass: !!c.pass, ready: !!e, via: e && e.source === 'mailbox' ? { user: e.from, label: e.label } : null, mailboxes: reports.mailboxes().map(a => ({ id: a.id, user: a.user, label: a.label || a.user })) }); }
+  if (p === '/api/mail' && m === 'PUT') {
+    if (!need()) return; const b = await readJson(req); const c = reports.mailCfg();
+    c.host = String(b.host || '').trim(); c.port = +b.port || 587; c.security = ['ssl', 'starttls', 'none'].includes(b.security) ? b.security : 'starttls';
+    c.accountId = String(b.accountId || ''); c.user = String(b.user || '').trim(); if (b.pass) c.pass = String(b.pass); c.from = String(b.from || '').trim(); c.fromName = String(b.fromName || '').trim();
+    store.save(); return json(res, 200, { ok: true });
+  }
+  if (p === '/api/mail/test' && m === 'POST') {
+    if (!need()) return; const b = await readJson(req);
+    try { await reports.sendMail({ to: [String(b.to || '').trim()], subject: 'Test email from WhatsApp Desk', text: 'Your email settings work. Scheduled reports will be sent from this address.', html: '<p>Your email settings work. Scheduled reports will be sent from this address.</p>' }); return json(res, 200, { ok: true }); }
+    catch (e) { return json(res, 400, { error: e.message }); }
+  }
+  // end-of-day bot report (admin): choose sections + period, view, download PDF / Excel, e-mail now, schedule
+  if (p === '/api/daily' && m === 'GET') { if (!need()) return; return json(res, 200, { cfg: daily.cfg(), sections: daily.SECTIONS, mailReady: !!reports.effectiveCfg(), mailFrom: (reports.effectiveCfg() || {}).from || (reports.effectiveCfg() || {}).user || '' }); }
+  if (p === '/api/daily' && m === 'PUT') { if (!need()) return; return json(res, 200, daily.setCfg(await readJson(req))); }
+  if (p === '/api/daily/report' && m === 'POST') { if (!need()) return; try { return json(res, 200, await daily.build(await readJson(req))); } catch (e) { return json(res, 500, { error: e.message }); } }
+  if (p === '/api/daily/download' && m === 'GET') {
+    if (!need()) return; const q = url.searchParams;
+    try { const r = await daily.build({ period: q.get('period') || undefined, date: q.get('date') || undefined, sections: q.get('sections') ? q.get('sections').split(',') : undefined }), f = daily.files(r, { pdf: q.get('format') !== 'xlsx', excel: q.get('format') === 'xlsx' })[0];
+      res.writeHead(200, { 'Content-Type': f.type, 'Content-Disposition': `attachment; filename="${f.filename}"` }); return res.end(f.content); } catch (e) { return json(res, 500, { error: e.message }); }
+  }
+  if (p === '/api/daily/send' && m === 'POST') { if (!need()) return; const b = await readJson(req); try { return json(res, 200, await daily.send(b, b.to ? String(b.to).split(/[\s,;]+/) : null, { pdf: b.pdf !== false, excel: b.excel !== false })); } catch (e) { return json(res, 400, { error: e.message }); } }
+
+  if (p === '/api/reports' && m === 'GET') { if (!need()) return; return json(res, 200, { reports: reports.list().map(r => ({ ...r, matching: reports.select(r).length })), columns: reports.COLUMNS, extraColumns: reports.extraColumns(), layout: reports.layout(), defaultColumns: reports.layout().main.filter(c => !c.fallback).map(c => c.key), dateCols: reports.dateCols(), statuses: [...new Set(db.orders.map(o => o.status || 'Pending'))], organizations: reports.companies(), byOrg: reports.byOrg() }); }
+  if (p === '/api/reports/preview' && m === 'POST') { if (!need()) return; return json(res, 200, reports.preview(await readJson(req))); }
+  if (p === '/api/reports/assist' && m === 'POST') { if (!need()) return; const b = await readJson(req); try { return json(res, 200, await ai.reportAssist(b.prompt, { today: new Date().toISOString().slice(0, 10), organizations: [...new Set(db.orders.map(o => o.organization).filter(Boolean))], statuses: [...new Set(db.orders.map(o => o.status || 'Pending'))], columns: [...reports.COLUMNS, ...reports.extraColumns()] })); } catch (e) { return json(res, 502, { error: e.message }); } }
+  if (p === '/api/reports' && m === 'POST') { if (!need()) return; try { const r = reports.clean(await readJson(req)); reports.list().push(r); store.save(); return json(res, 200, r); } catch (e) { return json(res, 400, { error: e.message }); } }
+  if ((mt = p.match(/^\/api\/reports\/([\w-]+)(?:\/(run|download))?$/))) {
+    if (!need()) return; const r = reports.list().find(x => x.id === mt[1]); if (!r) return json(res, 404, { error: 'Report not found' });
+    if (!mt[2] && m === 'PUT') { try { const n = reports.clean(await readJson(req), r); Object.assign(r, n); store.save(); return json(res, 200, r); } catch (e) { return json(res, 400, { error: e.message }); } }
+    if (!mt[2] && m === 'PATCH') { const b = await readJson(req); if (b.enabled !== undefined) r.enabled = !!b.enabled; store.save(); return json(res, 200, r); }
+    if (!mt[2] && m === 'DELETE') { db.reports = reports.list().filter(x => x !== r); store.save(); return json(res, 200, { ok: true }); }
+    if (mt[2] === 'run' && m === 'POST') { try { return json(res, 200, await reports.run(r, { manual: true })); } catch (e) { return json(res, 400, { error: e.message }); } }
+    if (mt[2] === 'download') { const f = reports.build(r).files.find(x => x.filename.endsWith('.' + (url.searchParams.get('format') === 'pdf' ? 'pdf' : 'xlsx'))); if (!f) return json(res, 404, { error: 'That format is switched off for this report' }); res.writeHead(200, { 'Content-Type': f.type, 'Content-Disposition': `attachment; filename="${f.filename}"` }); return res.end(f.content); }
+  }
+
+  // settings
+  if (p === '/api/settings' && m === 'PUT') {
+    if (!need()) return; const b = await readJson(req);
+    for (const k of Object.keys(store.DEFAULT_SETTINGS)) if (b[k] !== undefined && k !== 'menu' && k !== 'loginPage') db.settings[k] = String(b[k]);
+    if (b.loginPage !== undefined) db.settings.loginPage = b.loginPage === '' || b.loginPage === null ? '' : JSON.stringify(loginpage.clean(b.loginPage));
+    if (b.menu) for (const k of Object.keys(db.settings.menu)) if (b.menu[k]) db.settings.menu[k] = String(b.menu[k]).slice(0, 24);
+    store.save(); return json(res, 200, db.settings);
+  }
+  return json(res, 404, { error: 'Not found' });
+}
+
+// ---------- WhatsApp webhook ----------
+async function webhook(req, res, url) {
+  if (req.method === 'GET') {
+    if (url.searchParams.get('hub.mode') === 'subscribe' && url.searchParams.get('hub.verify_token') === cfg.verifyToken) { res.writeHead(200); return res.end(url.searchParams.get('hub.challenge')); }
+    res.writeHead(403); return res.end('Forbidden');
+  }
+  const raw = await readBody(req, 5e6);
+  if (cfg.appSecret) {
+    const sig = (req.headers['x-hub-signature-256'] || '').replace('sha256=', '');
+    const exp = crypto.createHmac('sha256', cfg.appSecret).update(raw).digest('hex');
+    if (sig.length !== exp.length || !crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(exp))) { res.writeHead(401); return res.end(); }
+  }
+  res.writeHead(200); res.end('OK'); // acknowledge fast, process after
+  const callsOnly = !wa.apiOn(); if (callsOnly && !wa.callsOn()) return;  // API switch off: the linked phone is in use, ignore Meta's messages (unless only calls run on the API)
+  let body; try { body = JSON.parse(raw); } catch { return; }
+  for (const entry of body.entry || []) for (const ch of entry.changes || []) {
+    const v = ch.value || {}; const names = {};
+    if (ch.field === 'calls' || v.calls) { try { calls.onWebhook(v); } catch (e) { console.error('call webhook:', e); } }
+    for (const c of v.contacts || []) names[c.wa_id] = (c.profile || {}).name;
+    for (const msg of v.messages || []) {
+      if (callsOnly && !(msg.type === 'interactive' && msg.interactive && msg.interactive.call_permission_reply)) continue; // chat stays on the linked phone
+      let text = '', replyId, file;
+      if (msg.type === 'text') text = msg.text.body;
+      else if (msg.type === 'interactive' && msg.interactive.call_permission_reply) { const cr = msg.interactive.call_permission_reply; const cv = bot.getConv(msg.from, names[msg.from]); bot.noteSys(cv, cr.response === 'accept' ? '📞 Customer allowed calls — you can call now' : '📞 Customer declined calls', true); continue; }
+      else if (msg.type === 'interactive') { const r = msg.interactive.list_reply || msg.interactive.button_reply || {}; text = r.title || ''; replyId = r.id; }
+      else if (msg.type === 'button') text = msg.button.text;
+      else if (['audio', 'image', 'video', 'document', 'sticker'].includes(msg.type)) {
+        const x = msg[msg.type] || {}; text = x.caption || '';
+        try { const d = await wa.downloadCloud(x.id); file = { buf: d.buf, mime: x.mime_type || d.mime, name: x.filename, voice: msg.type === 'audio' && !!x.voice }; }
+        catch (e) { text = (text ? text + '\n' : '') + `[${msg.type} received but could not be downloaded]`; }
+      }
+      else text = `[${msg.type} received]`;
+      try { await bot.onIncoming({ phone: msg.from, name: names[msg.from], text, replyId, waId: msg.id, media: file }); }
+      catch (e) { console.error('Failed to process message:', e); }
+    }
+  }
+}
+
+// ---------- pages customers open without signing in: /go/<link> (details form) and /call/<token> (voice call) ----------
+const hits = new Map(); // simple per-address limit so the public forms cannot be flooded
+const tooMany = (req, key, max, ms) => { const k = key + (req.socket.remoteAddress || ''), n = Date.now(), a = (hits.get(k) || []).filter(t => n - t < ms); a.push(n); hits.set(k, a); if (hits.size > 5000) hits.clear(); return a.length > max; };
+const html = (res, code, body) => { res.writeHead(code, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'no-referrer' }); res.end(body); };
+async function publicPages(req, res, url) {
+  const parts = url.pathname.split('/').filter(Boolean), m = req.method;
+  if (parts[0] === 'go' && parts.length === 2) {
+    const L = links.bySlug(decodeURIComponent(parts[1]));
+    if (m === 'GET') { if (!L || !L.enabled) return html(res, 404, links.notFound()); links.opened(L); return html(res, 200, links.page(links.publicInfo(L))); }
+    if (m === 'POST') {
+      if (!L) return json(res, 404, { error: 'This link is not available.' });
+      if (tooMany(req, 'go', 20, 10 * 60000)) return json(res, 429, { error: 'Too many tries. Please wait a few minutes.' });
+      try { return json(res, 200, links.submit(L, await readJson(req, 20e3))); } catch (e) { return json(res, 400, { error: e.message }); }
+    }
+  }
+  if (parts[0] === 'call' && parts[1] && /^[a-f0-9]{24}$/.test(parts[1])) {
+    const tok = parts[1], act = parts[2] || '';
+    if (!act && m === 'GET') { const info = webcall.guestInfo(tok); return info ? html(res, 200, webcall.page(info)) : html(res, 404, webcall.notFound()); }
+    if (act === 'poll' && m === 'GET') return json(res, 200, webcall.poll(tok, url.searchParams.get('room') || ''));
+    if (act === 'ring' && m === 'POST') {
+      if (tooMany(req, 'ring', 12, 10 * 60000)) return json(res, 429, { error: 'Too many calls. Please wait a few minutes.' });
+      try { return json(res, 200, webcall.ring(tok, String((await readJson(req, 120e3)).sdp || ''))); } catch (e) { return json(res, 400, { error: e.message }); }
+    }
+    if (act === 'decline' && m === 'POST') { const info = webcall.guestInfo(tok); if (info) webcall.decline(tok); return json(res, 200, { ok: true }); }
+    if (act === 'end' && m === 'POST') { const b = await readJson(req, 5e3), r = webcall.roomOf(String(b.room || '')); if (r && webcall.poll(tok, r.id).state !== 'ended') webcall.end(r.id, 'guest'); return json(res, 200, { ok: true }); }
+  }
+  return html(res, 404, links.notFound());
+}
+
+// ---------- server ----------
+http.createServer(async (req, res) => {
+  try { const h = String(req.headers.host || ''); if (h) require('./lib/shortlinks').seen(`${String(req.headers['x-forwarded-proto'] || (req.socket.encrypted ? 'https' : 'http')).split(',')[0]}://${h}`); } catch {}
+  const url = new URL(req.url, 'http://x');
+  try {
+    if (url.pathname === '/webhook') return await webhook(req, res, url);
+    if (url.pathname === '/webhooks/woo' && req.method === 'POST') { // WooCommerce → desk: a new / changed order, signed with the webhook secret
+      const raw = await readBody(req, 5e6);
+      try { return json(res, 200, await woo.webhook(raw, req.headers)); } catch (e) { return json(res, e.code === 401 ? 401 : 400, { error: e.message }); }
+    }
+    if (url.pathname === '/webhooks/scan' && req.method === 'POST') { // ScanSheet (NAS) -> desk: every saved entry becomes / updates a DC
+      const scan = require('./lib/scanhook');
+      if (!require('./lib/config').scanToken) { scan.noteBad('SCAN_TOKEN is not set in the desk .env file'); return json(res, 503, { error: 'Set SCAN_TOKEN in the desk .env file first.' }); }
+      if (!scan.authOk(req.headers['x-scan-token'])) { scan.noteBad('The ScanSheet sent a wrong token (DESK_TOKEN does not match SCAN_TOKEN)'); return json(res, 401, { error: 'Wrong token.' }); }
+      try { return json(res, 200, scan.receive(JSON.parse(await readBody(req, 2e6)))); } catch (e) { return json(res, 400, { error: e.message }); }
+    }
+    if (url.pathname === '/qbo/callback') { // Intuit sends the browser back here after the admin approves the connection
+      let msg = 'QuickBooks connected. Taking you back…', ok = true;
+      try { await qbo.handleCallback(url.searchParams); } catch (e) { msg = e.message; ok = false; }
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      return res.end(`<!doctype html><meta charset=utf-8><title>QuickBooks</title><body style="font-family:system-ui;padding:40px;max-width:520px;margin:auto"><h2>${ok ? '✅' : '⚠️'} ${ok ? 'Connected' : 'Could not connect'}</h2><p>${msg.replace(/[<>&]/g, '')}</p><p><a href="/#retail">Back to WhatsApp Desk</a></p>${ok ? '<script>setTimeout(()=>location.href="/#retail",1200)</script>' : ''}</body>`);
+    }
+    if (url.pathname.startsWith('/c/')) { // short link: send the visitor on to the long address
+      const to = require('./lib/shortlinks').resolve(url.pathname.slice(3).replace(/\/+$/, ''));
+      if (!to) { res.writeHead(404, { 'Content-Type': 'text/html; charset=utf-8' }); return res.end('<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><body style="font-family:system-ui;padding:40px;max-width:520px;margin:auto"><h2>Link not found</h2><p>This link is not valid any more. Please ask us for a new one.</p>'); }
+      res.writeHead(302, { Location: to, 'Cache-Control': 'no-store' }); return res.end();
+    }
+    if (url.pathname.startsWith('/go/') || url.pathname.startsWith('/call/')) return await publicPages(req, res, url);
+    if (url.pathname.startsWith('/api/')) return await api(req, res, url);
+    let f =path.normalize(path.join(PUBLIC, url.pathname === '/' ? 'index.html' : url.pathname));
+    if (!f.startsWith(PUBLIC) || !fs.existsSync(f) || fs.statSync(f).isDirectory()) f = path.join(PUBLIC, 'index.html');
+    const ext = path.extname(f), st = fs.statSync(f), etag = `W/"${st.size.toString(36)}-${Math.floor(st.mtimeMs).toString(36)}"`;
+    if (req.headers['if-none-match'] === etag) { res.writeHead(304, { ETag: etag, 'Cache-Control': 'no-cache' }); return res.end(); }
+    const zip = /\.(js|css|html|json|svg)$/.test(ext) && /\bgzip\b/.test(String(req.headers['accept-encoding'] || '')), head = { 'Content-Type': MIME[ext] || 'application/octet-stream', 'Cache-Control': 'no-cache', ETag: etag };
+    if (!zip) { res.writeHead(200, { ...head, 'Content-Length': st.size }); return fs.createReadStream(f).pipe(res); }
+    let hit = gzCache.get(f); // each file is compressed once (not on every request) and kept in memory until it changes
+    if (!hit || hit.etag !== etag) { hit = { etag, buf: zlib.gzipSync(fs.readFileSync(f), { level: 9 }) }; gzCache.set(f, hit); }
+    res.writeHead(200, { ...head, 'Content-Encoding': 'gzip', Vary: 'Accept-Encoding', 'Content-Length': hit.buf.length }); res.end(hit.buf);
+  } catch (e) { console.error(e); if (!res.headersSent) json(res, 500, { error: e.message }); else res.end(); }
+}).listen(cfg.port, () => {
+  try { require('./lib/scanhook').migrate(); require('./lib/scanhook').startFix(); } catch (e) { console.error('Scan backup migrate:', e.message); }
+  link.setHandlers({
+    onMessage: async x => { try { if (wa.mode() !== 'link') { link.note('IGNORED: the official WhatsApp API switch is ON, so the linked phone is paused. Settings → WhatsApp connection → choose “Without API”.'); return; } /* API switch is on: the linked phone is paused */ if (x.isGroup) bot.onGroupMessage(x); else if (x.fromMe) await bot.onPhoneSent(x); else { const L = link.settings(); await bot.onIncoming({ ...x, noBot: !L.autoBot, autoAssign: L.assignNew !== false }); link.note(`Delivered to the desk: chat +${x.phone}${L.autoBot ? ' (welcome menu sent)' : ' (welcome menu is OFF in settings)'}`); } } catch (e) { console.error('linked phone message failed:', e); link.note('ERROR while handling a message: ' + e.message); } },
+    onCall: x => wa.mode() === 'link' ? bot.onCall(x).catch(() => ({})) : ({}),
+  });
+  link.start();
+  sync.start(); retail.start(); qbo.start(); woo.start(); social.start(); wapost.start(); erp.start(); itemidx.start(); reports.start(); daily.start(); pofollow.start(); inbox.start();
+  console.log(`\n  WhatsApp Desk running at http://localhost:${cfg.port}`);
+  console.log(`  Mode: ${{ cloud: 'LIVE (WhatsApp Cloud API connected)', link: 'LINKED PHONE (WhatsApp Web style, see Settings)', demo: 'DEMO (no WhatsApp yet: use Settings → WhatsApp connection, or the Test Phone)' }[wa.mode()]}`);
+  console.log(`  Webhook URL path: /webhook   Verify token: ${cfg.verifyToken}\n`);
+});
